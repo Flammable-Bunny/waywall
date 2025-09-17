@@ -1,37 +1,24 @@
+#include "config/config.h"
 #include "glsl/texcopy.frag.h"
 #include "glsl/texcopy.vert.h"
+#include "glsl/text.frag.h"
 
 #include "scene.h"
 #include "server/gl.h"
 #include "server/ui.h"
 #include "util/alloc.h"
 #include "util/debug.h"
-#include "util/font.h"
 #include "util/log.h"
 #include "util/png.h"
 #include "util/prelude.h"
 #include <GLES2/gl2.h>
+#include <ft2build.h>
 #include <spng.h>
+#include <sys/types.h>
+#include FT_FREETYPE_H
 
-#define PACKED_ATLAS_SIZE 4096
-#define PACKED_ATLAS_WIDTH 2048
-#define PACKED_ATLAS_HEIGHT 16
-#define ATLAS_WIDTH 128
-#define ATLAS_HEIGHT 256
-#define CHAR_WIDTH 8
-#define CHAR_HEIGHT 16
-#define CHARS_PER_ROW (ATLAS_WIDTH / CHAR_WIDTH)
-
-static_assert(PACKED_ATLAS_SIZE == STATIC_ARRLEN(UTIL_TERMINUS_FONT));
-
-// clang-format off
-// There appears to be a bug in clang-format which causes it to remove the space after some
-// of these asterisks
-
-static_assert(PACKED_ATLAS_WIDTH * PACKED_ATLAS_HEIGHT == ATLAS_WIDTH * ATLAS_HEIGHT);
-static_assert(ATLAS_WIDTH * ATLAS_HEIGHT == PACKED_ATLAS_SIZE * 8);
-
-// clang-format on
+#define FONT_ATLAS_WIDTH 1024
+#define FONT_ATLAS_HEIGHT 1024
 
 struct vtx_shader {
     float src_pos[2];
@@ -81,7 +68,7 @@ struct scene_text {
 
     size_t shader_index;
 
-    GLuint vbo;
+    GLuint vbo, tex;
     size_t vtxcount;
 
     int32_t x, y;
@@ -214,12 +201,245 @@ mirror_render(struct scene_object *object) {
     }
 }
 
-static size_t
-text_build(GLuint vbo, struct scene *scene, const char *data,
+struct glyph_metadata
+get_glyph(struct scene *scene, const uint32_t c, const size_t font_height) {
+    struct font_size_obj *font_size_obj = NULL;
+
+    // find existing font size object
+    for (size_t i = 0; i < scene->font.fonts_len; i++) {
+        if (scene->font.fonts[i].font_height == font_height) {
+            font_size_obj = &scene->font.fonts[i];
+            break;
+        }
+    }
+
+    // create new font_size_obj if needed
+    if (!font_size_obj) {
+        size_t new_len = scene->font.fonts_len + 1;
+        scene->font.fonts = realloc(scene->font.fonts, new_len * sizeof(struct font_size_obj));
+        if (!scene->font.fonts)
+            ww_panic("Out of memory");
+
+        font_size_obj = &scene->font.fonts[scene->font.fonts_len];
+        memset(font_size_obj, 0, sizeof(*font_size_obj));
+        font_size_obj->font_height = font_height;
+        font_size_obj->atlas_width = FONT_ATLAS_WIDTH;
+        font_size_obj->atlas_height = FONT_ATLAS_HEIGHT;
+        font_size_obj->atlas_x = 0;
+        font_size_obj->atlas_y = 0;
+        font_size_obj->atlas_row_height = 0;
+        font_size_obj->glyphs_capacity = 128;
+        font_size_obj->glyphs =
+            calloc(font_size_obj->glyphs_capacity, sizeof(struct glyph_metadata));
+        font_size_obj->next_glyph_index = 0;
+
+        glGenTextures(1, &font_size_obj->atlas_tex);
+        gl_using_texture(GL_TEXTURE_2D, font_size_obj->atlas_tex) {
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_ALPHA, font_size_obj->atlas_width,
+                         font_size_obj->atlas_height, 0, GL_ALPHA, GL_UNSIGNED_BYTE, NULL);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        }
+
+        scene->font.fonts_len = new_len;
+    }
+
+    // search for existing glyph
+    for (size_t i = 0; i < font_size_obj->next_glyph_index; i++) {
+        if (font_size_obj->glyphs[i].character == c)
+            return font_size_obj->glyphs[i];
+    }
+
+    // render new glyph
+    if (scene->font.last_height != font_height) {
+        FT_Set_Pixel_Sizes(scene->font.face, 0, font_height);
+        scene->font.last_height = font_height;
+    }
+
+    if (FT_Load_Char(scene->font.face, c, FT_LOAD_RENDER))
+        ww_panic("Failed to load glyph U+%04X\n", c);
+
+    struct glyph_metadata data;
+    data.width = (int)scene->font.face->glyph->bitmap.width;
+    data.height = (int)scene->font.face->glyph->bitmap.rows;
+    data.bearingX = scene->font.face->glyph->bitmap_left;
+    data.bearingY = scene->font.face->glyph->bitmap_top;
+    data.advance = scene->font.face->glyph->advance.x;
+    data.character = c;
+
+    const unsigned char *buffer = scene->font.face->glyph->bitmap.buffer;
+
+    // handle row wrapping
+    if (font_size_obj->atlas_x + data.width > font_size_obj->atlas_width) {
+        font_size_obj->atlas_x = 0;
+        font_size_obj->atlas_y += font_size_obj->atlas_row_height;
+        font_size_obj->atlas_row_height = 0;
+    }
+
+    // atlas overflow check
+    if (font_size_obj->atlas_y + data.height > font_size_obj->atlas_height)
+        ww_panic("Atlas full, cannot add glyph U+%04X\n", c);
+
+    // copy glyph into atlas
+    gl_using_texture(GL_TEXTURE_2D, font_size_obj->atlas_tex) {
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, font_size_obj->atlas_x, font_size_obj->atlas_y,
+                        data.width, data.height, GL_ALPHA, GL_UNSIGNED_BYTE, buffer);
+    }
+
+    data.atlas_x = font_size_obj->atlas_x;
+    data.atlas_y = font_size_obj->atlas_y;
+
+    data.tex = font_size_obj->atlas_tex;
+
+    // update atlas placement
+    font_size_obj->atlas_x += data.width;
+    if (data.height > font_size_obj->atlas_row_height)
+        font_size_obj->atlas_row_height = data.height;
+
+    // store glyph in array
+    if (font_size_obj->next_glyph_index >= font_size_obj->glyphs_capacity) {
+        font_size_obj->glyphs_capacity *= 2;
+        struct glyph_metadata *tmp = realloc(
+            font_size_obj->glyphs, font_size_obj->glyphs_capacity * sizeof(struct glyph_metadata));
+        if (!tmp)
+            ww_panic("Out of memory");
+        font_size_obj->glyphs = tmp;
+    }
+    font_size_obj->glyphs[font_size_obj->next_glyph_index++] = data;
+
+    return data;
+}
+
+/*
+Decodes a single UTF-8 character into a Unicode codepoint.
+Advances *str to the next character.
+*/
+static uint32_t
+utf8_decode(const char **str) {
+    const unsigned char *s = (const unsigned char *)*str;
+    uint32_t cp;
+
+    if (s[0] < 0x80) {
+        // 1-byte ASCII
+        cp = s[0];
+        *str += 1;
+    } else if ((s[0] & 0xE0) == 0xC0) {
+        // 2-byte
+        cp = ((s[0] & 0x1F) << 6) | (s[1] & 0x3F);
+        *str += 2;
+    } else if ((s[0] & 0xF0) == 0xE0) {
+        // 3-byte
+        cp = ((s[0] & 0x0F) << 12) | ((s[1] & 0x3F) << 6) | (s[2] & 0x3F);
+        *str += 3;
+    } else if ((s[0] & 0xF8) == 0xF0) {
+        // 4-byte
+        cp = ((s[0] & 0x07) << 18) | ((s[1] & 0x3F) << 12) | ((s[2] & 0x3F) << 6) | (s[3] & 0x3F);
+        *str += 4;
+    } else {
+        // Invalid byte, skip
+        cp = 0xFFFD; // replacement char
+        *str += 1;
+    }
+
+    return cp;
+}
+
+static int
+parse_hex_digit(const u_int32_t c) {
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return 10 + (c - 'a');
+    if (c >= 'A' && c <= 'F')
+        return 10 + (c - 'A');
+    return -1;
+}
+
+static int
+parse_color(const u_int32_t *s, float rgba[4]) {
+    for (int i = 0; i < 4; i++) {
+        const int hi = parse_hex_digit(s[i * 2]);
+        const int lo = parse_hex_digit(s[i * 2 + 1]);
+        if (hi < 0 || lo < 0)
+            return -1;
+        const int val = (hi << 4) | lo;
+        rgba[i] = (float)val / 255.0f;
+    }
+    return 0;
+}
+
+struct text_build_ret {
+    size_t vertex_count;
+    GLuint tex;
+};
+
+static struct text_build_ret
+text_build(GLuint vbo, struct scene *scene, const char *data, const size_t data_len,
            const struct scene_text_options *options) {
     // The OpenGL context must be current.
 
-    size_t vtxcount = strlen(data) * 6;
+    // decode utf8
+    size_t capacity = 16;
+    size_t next_index = 0;
+    u_int32_t *cps = zalloc(capacity, sizeof(u_int32_t));
+    const char *c = data;
+    while (*c != '\0') {
+        if (next_index >= capacity) {
+            capacity *= 2;
+            u_int32_t *tmp = realloc(cps, capacity * sizeof(u_int32_t));
+            if (tmp == NULL) {
+                ww_panic("Out of memory");
+            }
+            cps = tmp;
+        }
+        cps[next_index++] = utf8_decode(&c);
+    }
+
+    const size_t cps_len = next_index;
+
+    // handle color tags
+    float current_color[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    next_index = 0;
+    capacity = 16;
+    struct text_char *text_chars = zalloc(16, sizeof(struct text_char));
+
+    for (size_t i = 0; i < cps_len; i++) {
+        if (cps[i] == '<' && cps[i + 1] == '#') {
+            // <#FFFFFFFF>
+            if (cps_len - i >= 10) {
+                if (parse_color(cps + i + 2, current_color) == 0 && cps[i + 10] == '>') {
+                    i += 10;
+                    continue;
+                }
+            }
+        }
+        if (next_index >= capacity) {
+            capacity *= 2;
+            struct text_char *tmp = realloc(text_chars, capacity * sizeof(struct text_char));
+            if (tmp == NULL) {
+                ww_panic("Out of memory");
+            }
+            text_chars = tmp;
+        }
+        text_chars[next_index].c = cps[i];
+        memcpy(text_chars[next_index++].rgba, current_color, sizeof(float) * 4);
+    }
+
+    free(cps);
+    const size_t character_count = next_index;
+
+    // get glyphs
+    next_index = 0;
+    struct glyph_metadata *glyphs = zalloc(character_count, sizeof(struct glyph_metadata));
+    for (size_t i = 0; i < character_count; i++)
+        glyphs[i] = get_glyph(scene, text_chars[i].c, options->size);
+
+    // build the VBOs
+
+    size_t vtxcount = character_count * 6;
 
     struct vtx_shader *vertices = zalloc(vtxcount, sizeof(*vertices));
     struct vtx_shader *ptr = vertices;
@@ -227,43 +447,47 @@ text_build(GLuint vbo, struct scene *scene, const char *data,
     int32_t x = options->x;
     int32_t y = options->y;
 
-    for (const char *c = data; *c != '\0'; c++) {
-        if (*c == '\n') {
-            y += CHAR_HEIGHT * options->size_multiplier;
+    for (size_t i = 0; i < character_count; i++) {
+        const struct glyph_metadata g = glyphs[i];
+
+        if (g.character == '\n') {
+            y += options->size;
             x = options->x;
-            continue;
-        } else if (*c == ' ') {
-            x += CHAR_WIDTH * options->size_multiplier;
             continue;
         }
 
         struct box src = {
-            .x = (*c % CHARS_PER_ROW) * CHAR_WIDTH,
-            .y = (*c / CHARS_PER_ROW) * CHAR_HEIGHT,
-            .width = CHAR_WIDTH,
-            .height = CHAR_HEIGHT,
+            .x = g.atlas_x,
+            .y = g.atlas_y,
+            .width = g.width,
+            .height = g.height,
         };
 
         struct box dst = {
-            .x = x,
-            .y = y,
-            .width = CHAR_WIDTH * options->size_multiplier,
-            .height = CHAR_HEIGHT * options->size_multiplier,
+            .x = x + g.bearingX,
+            .y = y - g.bearingY,
+            .width = g.width,
+            .height = g.height,
         };
 
-        rect_build(ptr, &src, &dst, (float[4]){1.0, 1.0, 1.0, 1.0}, options->rgba);
+        // src rgba is not used
+        rect_build(ptr, &src, &dst, (float[4]){0.0f, 0.0f, 0.0f, 0.0f}, text_chars[i].rgba);
         ptr += 6;
 
-        x += CHAR_WIDTH * options->size_multiplier;
+        x += (int)(g.advance >> 6);
     }
 
     gl_using_buffer(GL_ARRAY_BUFFER, vbo) {
         glBufferData(GL_ARRAY_BUFFER, vtxcount * sizeof(*vertices), vertices, GL_STATIC_DRAW);
     }
 
+    struct text_build_ret ret = {.vertex_count = vtxcount, .tex = glyphs->tex};
+
+    free(text_chars);
+    free(glyphs);
     free(vertices);
 
-    return vtxcount;
+    return ret;
 }
 
 static void
@@ -289,11 +513,11 @@ text_render(struct scene_object *object) {
     server_gl_shader_use(scene->shaders.data[text->shader_index].shader);
     glUniform2f(scene->shaders.data[text->shader_index].shader_u_dst_size, scene->ui->width,
                 scene->ui->height);
-    glUniform2f(scene->shaders.data[text->shader_index].shader_u_src_size, ATLAS_WIDTH,
-                ATLAS_HEIGHT);
+    glUniform2f(scene->shaders.data[text->shader_index].shader_u_src_size, FONT_ATLAS_WIDTH,
+                FONT_ATLAS_HEIGHT);
 
     gl_using_buffer(GL_ARRAY_BUFFER, text->vbo) {
-        gl_using_texture(GL_TEXTURE_2D, scene->buffers.font_tex) {
+        gl_using_texture(GL_TEXTURE_2D, text->tex) {
             draw_vertex_list(&scene->shaders.data[text->shader_index], text->vtxcount);
         }
     }
@@ -462,19 +686,20 @@ draw_stencil(struct scene *scene) {
 static void
 draw_debug_text(struct scene *scene) {
     // The OpenGL context must be current.
-    server_gl_shader_use(scene->shaders.data[0].shader);
-    glUniform2f(scene->shaders.data[0].shader_u_dst_size, scene->ui->width, scene->ui->height);
-    glUniform2f(scene->shaders.data[0].shader_u_src_size, ATLAS_WIDTH, ATLAS_HEIGHT);
+    server_gl_shader_use(scene->shaders.data[1].shader);
+    glUniform2f(scene->shaders.data[1].shader_u_dst_size, scene->ui->width, scene->ui->height);
+    glUniform2f(scene->shaders.data[1].shader_u_src_size, FONT_ATLAS_WIDTH, FONT_ATLAS_HEIGHT);
 
     const char *str = util_debug_str();
-    scene->buffers.debug_vtxcount = text_build(
-        scene->buffers.debug, scene, str,
-        &(struct scene_text_options){
-            .x = 8, .y = 8, .rgba = {1, 1, 1, 1}, .size_multiplier = 1, .shader_name = NULL});
+    const struct text_build_ret ret =
+        text_build(scene->buffers.debug, scene, str, strlen(str),
+                   &(struct scene_text_options){.x = 8, .y = 8, .size = 20, .shader_name = NULL});
+
+    scene->buffers.debug_vtxcount = ret.vertex_count;
 
     gl_using_buffer(GL_ARRAY_BUFFER, scene->buffers.debug) {
-        gl_using_texture(GL_TEXTURE_2D, scene->buffers.font_tex) {
-            draw_vertex_list(&scene->shaders.data[0], scene->buffers.debug_vtxcount);
+        gl_using_texture(GL_TEXTURE_2D, ret.tex) {
+            draw_vertex_list(&scene->shaders.data[1], scene->buffers.debug_vtxcount);
         }
     }
 }
@@ -696,15 +921,21 @@ scene_create(struct config *cfg, struct server_gl *gl, struct server_ui *ui) {
         ww_log(LOG_INFO, "max image size: %" PRIu32 "x%" PRIu32, scene->image_max_size,
                scene->image_max_size);
 
-        scene->shaders.count = cfg->shaders.count + 1;
+        scene->shaders.count = cfg->shaders.count + 2;
         scene->shaders.data = malloc(sizeof(struct scene_shader) * scene->shaders.count);
         if (!shader_create(scene->gl, &scene->shaders.data[0], strdup("default"), NULL, NULL)) {
             ww_log(LOG_ERROR, "error creating default shader");
             server_gl_exit(scene->gl);
             goto fail_compile_texture_copy;
         }
+        if (!shader_create(scene->gl, &scene->shaders.data[1], strdup("text"),
+                           WAYWALL_GLSL_TEXCOPY_VERT_H, WAYWALL_GLSL_TEXT_FRAG_H)) {
+            ww_log(LOG_ERROR, "error creating text shader");
+            server_gl_exit(scene->gl);
+            goto fail_compile_texture_copy;
+        }
         for (size_t i = 0; i < cfg->shaders.count; i++) {
-            if (!shader_create(scene->gl, &scene->shaders.data[i + 1],
+            if (!shader_create(scene->gl, &scene->shaders.data[i + 2],
                                strdup(cfg->shaders.data[i].name), cfg->shaders.data[i].vertex,
                                cfg->shaders.data[i].fragment)) {
                 ww_log(LOG_ERROR, "error creating %s shader", cfg->shaders.data[i].name);
@@ -718,36 +949,16 @@ scene_create(struct config *cfg, struct server_gl *gl, struct server_ui *ui) {
         glGenBuffers(1, &scene->buffers.debug);
         glGenBuffers(1, &scene->buffers.stencil_rect);
 
-        // Initialize the font texture atlas.
-        glGenTextures(1, &scene->buffers.font_tex);
-        unsigned char *atlas = zalloc(1, PACKED_ATLAS_SIZE * 32);
-        for (size_t py = 0; py < PACKED_ATLAS_HEIGHT; py++) {
-            for (size_t px = 0; px < PACKED_ATLAS_WIDTH; px++) {
-                size_t packed_pos = py * PACKED_ATLAS_WIDTH + px;
-                bool set = UTIL_TERMINUS_FONT[packed_pos / 8] & (1 << (7 - packed_pos % 8));
-
-                if (set) {
-                    size_t x = px % ATLAS_WIDTH;
-                    size_t y = py + (px / ATLAS_WIDTH) * CHAR_HEIGHT;
-                    size_t pos = (y * ATLAS_WIDTH + x) * 4;
-
-                    atlas[pos] = 0xFF;
-                    atlas[pos + 1] = 0xFF;
-                    atlas[pos + 2] = 0xFF;
-                    atlas[pos + 3] = 0xFF;
-                }
-            }
+        // Initialize freetype
+        if (FT_Init_FreeType(&scene->font.ft)) {
+            ww_log(LOG_ERROR, "Failed to init freetype.");
+            exit(1);
         }
 
-        gl_using_texture(GL_TEXTURE_2D, scene->buffers.font_tex) {
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, ATLAS_WIDTH, ATLAS_HEIGHT, 0, GL_RGBA,
-                         GL_UNSIGNED_BYTE, atlas);
-
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        if (FT_New_Face(scene->font.ft, cfg->theme.font_path, 0, &scene->font.face)) {
+            ww_log(LOG_ERROR, "Failed to load freetype face.");
+            exit(1);
         }
-
-        free(atlas);
     }
 
     scene->on_gl_frame.notify = on_gl_frame;
@@ -780,7 +991,6 @@ scene_destroy(struct scene *scene) {
         }
 
         glDeleteBuffers(2, (GLuint[]){scene->buffers.debug, scene->buffers.stencil_rect});
-        glDeleteTextures(1, &scene->buffers.font_tex);
     }
     free(scene->shaders.data);
 
@@ -840,14 +1050,20 @@ scene_add_text(struct scene *scene, const char *data, const struct scene_text_op
     text->x = options->x;
     text->y = options->y;
 
-    // Find correct shader for this text
-    text->shader_index = shader_find_index(scene, options->shader_name);
+    if (options->shader_name == NULL) {
+        text->shader_index = 1;
+    } else {
+        text->shader_index = shader_find_index(scene, options->shader_name);
+    }
 
     server_gl_with(scene->gl, false) {
         glGenBuffers(1, &text->vbo);
         ww_assert(text->vbo);
 
-        text->vtxcount = text_build(text->vbo, scene, data, options);
+        const struct text_build_ret ret = text_build(text->vbo, scene, data, strlen(data), options);
+
+        text->vtxcount = ret.vertex_count;
+        text->tex = ret.tex;
     }
 
     text->object.depth = options->depth;

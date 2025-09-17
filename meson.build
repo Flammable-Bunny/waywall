@@ -51,6 +51,7 @@ xcb_composite = dependency('xcb-composite')
 xcb_res = dependency('xcb-res')
 xcb_xtest = dependency('xcb-xtest')
 xwayland = dependency('xwayland')
+freetype = dependency('freetype2')
 
 waywall_deps = [
   cc.find_library('m'),
@@ -71,6 +72,7 @@ waywall_deps = [
   xcb_res,
   xcb_xtest,
   xwayland,
+  freetype,
 ]
 
 subdir('protocol')

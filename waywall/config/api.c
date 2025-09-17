@@ -969,73 +969,6 @@ l_state(lua_State *L) {
 }
 
 static int
-l_text_legacy(lua_State *L, struct wrap *wrap) {
-    static const int ARG_TEXT = 1;
-    static const int ARG_X = 2;
-    static const int ARG_Y = 3;
-    static const int ARG_COLOR = 4;
-    static const int ARG_SIZE = 5;
-    static const int ARG_SHADER = 6;
-
-    ww_log(LOG_WARN, "using legacy text creation code path - update your configuration");
-
-    const char *data = luaL_checkstring(L, ARG_TEXT);
-    int x = luaL_checkinteger(L, ARG_X);
-    int y = luaL_checkinteger(L, ARG_Y);
-
-    float rgba[4] = {1.0, 1.0, 1.0, 1.0};
-    if (lua_gettop(L) >= ARG_COLOR) {
-        const char *raw_color = luaL_checkstring(L, ARG_COLOR);
-
-        uint8_t u8_rgba[4] = {0};
-        if (config_parse_hex(u8_rgba, raw_color) != 0) {
-            return luaL_error(L, "expected a valid hex color, got '%s'", raw_color);
-        }
-
-        rgba[0] = (float)u8_rgba[0] / UINT8_MAX;
-        rgba[1] = (float)u8_rgba[1] / UINT8_MAX;
-        rgba[2] = (float)u8_rgba[2] / UINT8_MAX;
-        rgba[3] = (float)u8_rgba[3] / UINT8_MAX;
-    }
-
-    int size = 1;
-    if (lua_gettop(L) >= ARG_SIZE) {
-        size = luaL_checkinteger(L, ARG_SIZE);
-    }
-
-    char *shader_name = NULL;
-    if (lua_gettop(L) >= ARG_SHADER) {
-        shader_name = strdup(luaL_checkstring(L, ARG_SHADER));
-    }
-    lua_settop(L, ARG_SHADER);
-
-    struct scene_text_options options = {
-        .x = x,
-        .y = y,
-        .rgba = {rgba[0], rgba[1], rgba[2], rgba[3]},
-        .size_multiplier = size,
-        .depth = DEFAULT_DEPTH,
-        .shader_name = shader_name,
-    };
-
-    // Body
-    struct scene_text **text = lua_newuserdata(L, sizeof(*text));
-    check_alloc(text);
-
-    luaL_getmetatable(L, METATABLE_TEXT);
-    lua_setmetatable(L, -2);
-
-    *text = scene_add_text(wrap->scene, data, &options);
-    free(options.shader_name);
-    if (!*text) {
-        return luaL_error(L, "failed to create text");
-    }
-
-    // Epilogue. The userdata (text) was already pushed to the stack by the above code.
-    return 1;
-}
-
-static int
 l_text(lua_State *L) {
     static const int ARG_TEXT = 1;
     static const int ARG_OPTIONS = 2;
@@ -1049,9 +982,6 @@ l_text(lua_State *L) {
 
     const char *data = luaL_checkstring(L, ARG_TEXT);
 
-    if (!lua_istable(L, ARG_OPTIONS)) {
-        return l_text_legacy(L, wrap);
-    }
     lua_settop(L, ARG_OPTIONS);
 
     struct scene_text_options options = {0};
@@ -1072,31 +1002,12 @@ l_text(lua_State *L) {
     options.y = lua_tointeger(L, -1);
     lua_pop(L, 1);
 
-    lua_pushstring(L, "color");
-    lua_rawget(L, ARG_OPTIONS);
-    if (lua_type(L, -1) == LUA_TSTRING) {
-        const char *raw_color = lua_tostring(L, -1);
-
-        uint8_t u8_rgba[4] = {0};
-        if (config_parse_hex(u8_rgba, raw_color) != 0) {
-            return luaL_error(L, "expected a valid hex color, got '%s'", raw_color);
-        }
-
-        options.rgba[0] = (float)u8_rgba[0] / UINT8_MAX;
-        options.rgba[1] = (float)u8_rgba[1] / UINT8_MAX;
-        options.rgba[2] = (float)u8_rgba[2] / UINT8_MAX;
-        options.rgba[3] = (float)u8_rgba[3] / UINT8_MAX;
-    } else {
-        options.rgba[0] = options.rgba[1] = options.rgba[2] = options.rgba[3] = 1;
-    }
-    lua_pop(L, 1);
-
     lua_pushstring(L, "size");
     lua_rawget(L, ARG_OPTIONS);
     if (lua_type(L, -1) == LUA_TNUMBER) {
-        options.size_multiplier = lua_tointeger(L, -1);
+        options.size = lua_tointeger(L, -1);
     } else {
-        options.size_multiplier = 1;
+        options.size = 1;
     }
     lua_pop(L, 1);
 

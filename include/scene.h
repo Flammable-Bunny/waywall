@@ -3,14 +3,53 @@
 
 #include "config/config.h"
 #include "util/box.h"
-#include "util/prelude.h"
+#include <GLES2/gl2.h>
+#include <ft2build.h>
 #include <wayland-server-core.h>
 #include <wayland-util.h>
+#include FT_FREETYPE_H
+#include "server/gl.h"
 
 #define SHADER_SRC_POS_ATTRIB_LOC 0
 #define SHADER_DST_POS_ATTRIB_LOC 1
 #define SHADER_SRC_RGBA_ATTRIB_LOC 2
 #define SHADER_DST_RGBA_ATTRIB_LOC 3
+
+// represents a single character to draw, with color
+struct text_char {
+    uint32_t c;    // utf8 codepoint
+    float rgba[4]; // color
+};
+
+// single glyph's data
+struct glyph_metadata {
+    int width, height;
+    int bearingX, bearingY;
+    unsigned int advance;
+
+    // atlas position
+    int atlas_x, atlas_y;
+    GLuint tex;
+
+    uint32_t character;
+};
+
+// all glyphs for a given font size in a dynamic atlas
+struct font_size_obj {
+    size_t font_height;
+
+    struct glyph_metadata *glyphs;
+    size_t next_glyph_index; // number of glyphs loaded
+    size_t glyphs_capacity;  // allocated size of chars array
+
+    // atlas
+    GLuint atlas_tex;
+    int atlas_width;
+    int atlas_height;
+    int atlas_x;
+    int atlas_y;
+    int atlas_row_height;
+};
 
 struct scene {
     struct server_gl *gl;
@@ -28,8 +67,6 @@ struct scene {
         size_t debug_vtxcount;
 
         unsigned int stencil_rect;
-
-        unsigned int font_tex;
     } buffers;
 
     struct {
@@ -49,6 +86,16 @@ struct scene {
     int skipped_frames;
 
     struct wl_listener on_gl_frame;
+
+    struct {
+        FT_Library ft;
+        FT_Face face;
+
+        size_t last_height; // last height set in freetype
+
+        struct font_size_obj *fonts; // array of font sizes
+        size_t fonts_len;
+    } font;
 };
 
 struct scene_shader {
@@ -78,8 +125,7 @@ struct scene_text_options {
     int32_t x;
     int32_t y;
 
-    float rgba[4];
-    int32_t size_multiplier;
+    int32_t size;
 
     int32_t depth;
     char *shader_name;

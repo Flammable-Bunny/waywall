@@ -150,4 +150,13 @@ M.text = priv.text
 --- Toggle the Waywall window between fullscreen and not
 M.toggle_fullscreen = priv.toggle_fullscreen
 
+--- Creates a irc client
+-- @param ip The ip to connect to.
+-- @param port The port to connect on.
+-- @param user The user/nickname to provide
+-- @param token The token/password to provide.
+-- @param callback The function that will be called on each message received.
+-- @return irc-client The irc client object, can be used to close the connection and send messages.
+M.irc_client_create = priv.irc_client_create
+
 package.loaded["waywall"] = M

@@ -1,5 +1,7 @@
 #include "server/server.h"
+
 #include "config/config.h"
+#include "irc.h"
 #include "server/backend.h"
 #include "server/cursor.h"
 #include "server/ui.h"
@@ -144,6 +146,8 @@ backend_display_tick(int fd, uint32_t mask, void *data) {
         wl_display_terminate(server->display);
         return 0;
     }
+
+    manage_new_messages();
 
     return num_dispatched > 0;
 }

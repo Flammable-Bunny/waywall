@@ -5,6 +5,7 @@
 #include "config/internal.h"
 #include "config/vm.h"
 #include "instance.h"
+#include "irc.h"
 #include "scene.h"
 #include "server/server.h"
 #include "server/ui.h"
@@ -77,6 +78,7 @@ static const struct {
 #define METATABLE_IMAGE "waywall.image"
 #define METATABLE_MIRROR "waywall.mirror"
 #define METATABLE_TEXT "waywall.text"
+#define METATABLE_IRC "waywall.irc"
 
 #define STARTUP_ERRMSG(function) function " cannot be called during startup"
 
@@ -236,6 +238,58 @@ text_gc(lua_State *L) {
         scene_object_destroy((struct scene_object *)*text);
     }
     *text = NULL;
+
+    return 0;
+}
+
+static int
+irc_client_close_(lua_State *L) {
+    struct Irc_client **client = lua_touserdata(L, 1);
+
+    if (!*client) {
+        return luaL_error(L, "cannot close timer more than once");
+    }
+
+    irc_client_destroy(*client);
+    *client = NULL;
+
+    return 0;
+}
+
+static int
+irc_client_send_(lua_State *L) {
+    struct Irc_client **client = lua_touserdata(L, 1);
+
+    const char *message = luaL_checkstring(L, 2);
+
+    irc_client_send(*client, message);
+
+    return 0;
+}
+
+static int
+irc_client_index(lua_State *L) {
+    const char *key = luaL_checkstring(L, 2);
+
+    if (strcmp(key, "close") == 0) {
+        lua_pushcfunction(L, irc_client_close_);
+    } else if (strcmp(key, "send") == 0) {
+        lua_pushcfunction(L, irc_client_send_);
+    } else {
+        lua_pushnil(L);
+    }
+
+    return 1;
+}
+
+static int
+irc_client_gc(lua_State *L) {
+    struct Irc_client **client = lua_touserdata(L, 1);
+
+    if (*client) {
+        irc_client_destroy(*client);
+    }
+    *client = NULL;
 
     return 0;
 }
@@ -1121,6 +1175,46 @@ l_toggle_fullscreen(lua_State *L) {
     return 0;
 }
 
+static int
+l_irc_client(lua_State *L) {
+    static const int ARG_IP = 1;
+    static const int ARG_PORT = 2;
+    static const int ARG_USER = 3;
+    static const int ARG_TOKEN = 4;
+    static const int ARG_CALLBACK = 5;
+
+    // Prologue
+    struct config_vm *vm = config_vm_from(L);
+    struct wrap *wrap = config_vm_get_wrap(vm);
+    if (!wrap) {
+        return luaL_error(L, STARTUP_ERRMSG("irc_client"));
+    }
+
+    const char *server = luaL_checkstring(L, ARG_IP);
+    const long port = luaL_checkinteger(L, ARG_PORT);
+    const char *nick = luaL_checkstring(L, ARG_USER);
+    const char *pass = luaL_checkstring(L, ARG_TOKEN);
+
+    luaL_checktype(L, ARG_CALLBACK, LUA_TFUNCTION);
+    lua_pushvalue(L, ARG_CALLBACK);
+    const int callback = luaL_ref(L, LUA_REGISTRYINDEX);
+
+    // Body
+    struct Irc_client **client = lua_newuserdata(L, sizeof(*client));
+    check_alloc(client);
+
+    luaL_getmetatable(L, METATABLE_IRC);
+    lua_setmetatable(L, -2);
+
+    *client = irc_client_create(server, port, nick, pass, callback, L);
+    if (!*client) {
+        luaL_unref(L, LUA_REGISTRYINDEX, callback);
+        return luaL_error(L, "failed to create irc client");
+    }
+    // Epilogue. The userdata (irc client) was already pushed to the stack by the above code.
+    return 1;
+}
+
 static const struct luaL_Reg lua_lib[] = {
     // public (see api.lua)
     {"active_res", l_active_res},
@@ -1141,6 +1235,7 @@ static const struct luaL_Reg lua_lib[] = {
     {"state", l_state},
     {"text", l_text},
     {"toggle_fullscreen", l_toggle_fullscreen},
+    {"irc_client_create", l_irc_client},
 
     // private (see init.lua)
     {"log", l_log},
@@ -1183,6 +1278,16 @@ config_api_init(struct config_vm *vm) {
     lua_pushcfunction(vm->L, text_index);     // stack: n+3
     lua_settable(vm->L, -3);                  // stack: n+1
     lua_pop(vm->L, 1);                        // stack: n
+
+    // Create the metatable for "irc_client" objects.
+    luaL_newmetatable(vm->L, METATABLE_IRC);    // stack: n+1
+    lua_pushstring(vm->L, "__gc");              // stack: n+2
+    lua_pushcfunction(vm->L, irc_client_gc);    // stack: n+3
+    lua_settable(vm->L, -3);                    // stack: n+1
+    lua_pushstring(vm->L, "__index");           // stack: n+2
+    lua_pushcfunction(vm->L, irc_client_index); // stack: n+3
+    lua_settable(vm->L, -3);                    // stack: n+1
+    lua_pop(vm->L, 1);                          // stack: n
 
     for (size_t i = 0; i < STATIC_ARRLEN(EMBEDDED_LUA); i++) {
         if (config_vm_exec_bcode(vm, EMBEDDED_LUA[i].data, EMBEDDED_LUA[i].size,

@@ -397,3 +397,52 @@ config_vm_try_action(struct config_vm *vm, size_t index) {
 
     return consumed;
 }
+
+bool
+config_vm_try_callback_arg(struct config_vm *vm) {
+    ww_assert(lua_gettop(vm->L) == 2); // the function + arugment
+
+    lua_State *coro = lua_newthread(vm->L); // stack: +1 coroutine
+    coro_table_add(coro, NULL);
+
+    // move function from vm->L to coro stack
+    lua_pushvalue(vm->L, 1);
+    lua_xmove(vm->L, coro, 1);
+
+    // push argument onto the coroutine stack
+    lua_pushvalue(vm->L, 2);
+    lua_xmove(vm->L, coro, 1);
+
+    // pop function and argument from the vm->L
+    lua_pop(vm->L, 2);
+
+    // coro stack:
+    // 1. callback func
+    // 2. arg
+
+    // resume the coroutine passing 1 argument
+    int ret = lua_resume(coro, 1);
+    bool consumed = true;
+
+    switch (ret) {
+    case LUA_YIELD:
+        process_yield(coro);
+        break;
+    case 0:
+        if (lua_gettop(coro) == 0) {
+            lua_pushnil(coro);
+        }
+        consumed = (!lua_isboolean(coro, -1) || lua_toboolean(coro, -1));
+        coro_table_del(coro);
+        break;
+    default:
+        ww_log(LOG_ERROR, "failed to start callback: '%s'", lua_tostring(coro, -1));
+        coro_table_del(coro);
+        break;
+    }
+
+    lua_pop(vm->L, 1); // pop coroutine from vm->L stack
+    ww_assert(lua_gettop(vm->L) == 0);
+
+    return consumed;
+}

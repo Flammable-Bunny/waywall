@@ -407,9 +407,9 @@ text_build(GLuint vbo, struct scene *scene, const char *data, const size_t data_
     struct text_char *text_chars = zalloc(16, sizeof(struct text_char));
 
     for (size_t i = 0; i < cps_len; i++) {
-        if (cps[i] == '<' && cps[i + 1] == '#') {
+        if (i + 1 < cps_len && cps[i] == '<' && cps[i + 1] == '#') {
             // <#FFFFFFFF>
-            if (cps_len - i >= 10) {
+            if (cps_len - i >= 11) {
                 if (parse_color(cps + i + 2, current_color) == 0 && cps[i + 10] == '>') {
                     i += 10;
                     continue;

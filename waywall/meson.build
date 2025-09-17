@@ -44,6 +44,7 @@ waywall_src = files(
   'subproc.c',
   'timer.c',
   'wrap.c',
+  'irc.c',
 )
 
 executable('waywall',

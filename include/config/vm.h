@@ -41,5 +41,6 @@ void config_vm_resume(struct config_vm_waker *waker);
 void config_vm_signal_event(struct config_vm *vm, const char *name);
 bool config_vm_try_action(struct config_vm *vm, size_t index);
 bool config_vm_try_callback_arg(struct config_vm *vm);
+bool config_vm_try_callback_args2(struct config_vm *vm);
 
 #endif

@@ -5,6 +5,8 @@
 #include "util/box.h"
 #include <GLES2/gl2.h>
 #include <ft2build.h>
+#include <stddef.h>
+#include <sys/types.h>
 #include <wayland-server-core.h>
 #include <wayland-util.h>
 #include FT_FREETYPE_H
@@ -126,6 +128,7 @@ struct scene_text_options {
     int32_t y;
 
     int32_t size;
+    int32_t atlas_index;
 
     int32_t depth;
     char *shader_name;
@@ -137,7 +140,7 @@ struct scene *scene_create(struct config *cfg, struct server_gl *gl, struct serv
 void scene_destroy(struct scene *scene);
 
 struct scene_image *scene_add_image(struct scene *scene, const struct scene_image_options *options,
-                                    const char *path);
+                                    const char *path, const size_t size);
 struct scene_mirror *scene_add_mirror(struct scene *scene,
                                       const struct scene_mirror_options *options);
 struct scene_text *scene_add_text(struct scene *scene, const char *data,
@@ -146,5 +149,7 @@ struct scene_text *scene_add_text(struct scene *scene, const char *data,
 void scene_object_destroy(struct scene_object *object);
 int32_t scene_object_get_depth(struct scene_object *object);
 void scene_object_set_depth(struct scene_object *object, int32_t depth);
+void scene_object_hide(struct scene_object *object);
+void scene_object_show(struct scene_object *object);
 
 #endif

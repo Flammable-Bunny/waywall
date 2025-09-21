@@ -11,6 +11,6 @@ struct util_png {
     uint32_t width, height;
 };
 
-struct util_png util_png_decode(const char *path, int max_size);
+struct util_png util_png_decode(const char *data, size_t data_size, int max_size);
 
 #endif

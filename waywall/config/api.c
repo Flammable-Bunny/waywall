@@ -4,6 +4,7 @@
 #include "config/config.h"
 #include "config/internal.h"
 #include "config/vm.h"
+#include "http.h"
 #include "instance.h"
 #include "irc.h"
 #include "scene.h"
@@ -79,6 +80,7 @@ static const struct {
 #define METATABLE_MIRROR "waywall.mirror"
 #define METATABLE_TEXT "waywall.text"
 #define METATABLE_IRC "waywall.irc"
+#define METATABLE_HTTP "waywall.http"
 
 #define STARTUP_ERRMSG(function) function " cannot be called during startup"
 
@@ -114,6 +116,24 @@ object_set_depth(lua_State *L) {
 }
 
 static int
+object_show(lua_State *L) {
+    struct scene_object **object = lua_touserdata(L, 1);
+
+    scene_object_show(*object);
+
+    return 0;
+}
+
+static int
+object_hide(lua_State *L) {
+    struct scene_object **object = lua_touserdata(L, 1);
+
+    scene_object_hide(*object);
+
+    return 0;
+}
+
+static int
 image_close(lua_State *L) {
     struct scene_image **image = lua_touserdata(L, 1);
 
@@ -137,6 +157,10 @@ image_index(lua_State *L) {
         lua_pushcfunction(L, object_get_depth);
     } else if (strcmp(key, "set_depth") == 0) {
         lua_pushcfunction(L, object_set_depth);
+    } else if (strcmp(key, "show") == 0) {
+        lua_pushcfunction(L, object_show);
+    } else if (strcmp(key, "hide") == 0) {
+        lua_pushcfunction(L, object_hide);
     } else {
         lua_pushnil(L);
     }
@@ -180,6 +204,10 @@ mirror_index(lua_State *L) {
         lua_pushcfunction(L, object_get_depth);
     } else if (strcmp(key, "set_depth") == 0) {
         lua_pushcfunction(L, object_set_depth);
+    } else if (strcmp(key, "show") == 0) {
+        lua_pushcfunction(L, object_show);
+    } else if (strcmp(key, "hide") == 0) {
+        lua_pushcfunction(L, object_hide);
     } else {
         lua_pushnil(L);
     }
@@ -223,6 +251,10 @@ text_index(lua_State *L) {
         lua_pushcfunction(L, object_get_depth);
     } else if (strcmp(key, "set_depth") == 0) {
         lua_pushcfunction(L, object_set_depth);
+    } else if (strcmp(key, "show") == 0) {
+        lua_pushcfunction(L, object_show);
+    } else if (strcmp(key, "hide") == 0) {
+        lua_pushcfunction(L, object_hide);
     } else {
         lua_pushnil(L);
     }
@@ -247,7 +279,7 @@ irc_client_close_(lua_State *L) {
     struct Irc_client **client = lua_touserdata(L, 1);
 
     if (!*client) {
-        return luaL_error(L, "cannot close timer more than once");
+        return luaL_error(L, "cannot close irc client more than once");
     }
 
     irc_client_destroy(*client);
@@ -288,6 +320,58 @@ irc_client_gc(lua_State *L) {
 
     if (*client) {
         irc_client_destroy(*client);
+    }
+    *client = NULL;
+
+    return 0;
+}
+
+static int
+http_client_close_(lua_State *L) {
+    struct Http_client **client = lua_touserdata(L, 1);
+
+    if (!*client) {
+        return luaL_error(L, "cannot close http client more than once");
+    }
+
+    http_client_destroy(*client);
+    *client = NULL;
+
+    return 0;
+}
+
+static int
+http_client_get_(lua_State *L) {
+    struct Http_client **client = lua_touserdata(L, 1);
+
+    const char *message = luaL_checkstring(L, 2);
+
+    http_client_get(*client, message);
+
+    return 0;
+}
+
+static int
+http_client_index(lua_State *L) {
+    const char *key = luaL_checkstring(L, 2);
+
+    if (strcmp(key, "close") == 0) {
+        lua_pushcfunction(L, http_client_close_);
+    } else if (strcmp(key, "get") == 0) {
+        lua_pushcfunction(L, http_client_get_);
+    } else {
+        lua_pushnil(L);
+    }
+
+    return 1;
+}
+
+static int
+http_client_gc(lua_State *L) {
+    struct Http_client **client = lua_touserdata(L, 1);
+
+    if (*client) {
+        http_client_destroy(*client);
     }
     *client = NULL;
 
@@ -491,7 +575,7 @@ l_floating_shown(lua_State *L) {
 
 static int
 l_image(lua_State *L) {
-    static const int ARG_PATH = 1;
+    static const int ARG_DATA = 1;
     static const int ARG_OPTIONS = 2;
 
     // Prologue
@@ -501,7 +585,9 @@ l_image(lua_State *L) {
         return luaL_error(L, STARTUP_ERRMSG("image"));
     }
 
-    const char *path = luaL_checkstring(L, ARG_PATH);
+    size_t data_size;
+    // use checklstring because bin data
+    const char *data = luaL_checklstring(L, ARG_DATA, &data_size);
     luaL_checktype(L, ARG_OPTIONS, LUA_TTABLE);
     lua_settop(L, ARG_OPTIONS);
 
@@ -531,10 +617,10 @@ l_image(lua_State *L) {
     luaL_getmetatable(L, METATABLE_IMAGE);
     lua_setmetatable(L, -2);
 
-    *image = scene_add_image(wrap->scene, &options, path);
+    *image = scene_add_image(wrap->scene, &options, data, data_size);
     free(options.shader_name);
     if (!*image) {
-        return luaL_error(L, "failed to create image from PNG at '%s'", path);
+        return luaL_error(L, "failed to create image");
     }
 
     // Epilogue. The userdata (image) was already pushed to the stack by the above code.
@@ -1215,6 +1301,37 @@ l_irc_client(lua_State *L) {
     return 1;
 }
 
+static int
+l_http_client(lua_State *L) {
+    static const int ARG_CALLBACK = 1;
+
+    // Prologue
+    struct config_vm *vm = config_vm_from(L);
+    struct wrap *wrap = config_vm_get_wrap(vm);
+    if (!wrap) {
+        return luaL_error(L, STARTUP_ERRMSG("http_client"));
+    }
+
+    luaL_checktype(L, ARG_CALLBACK, LUA_TFUNCTION);
+    lua_pushvalue(L, ARG_CALLBACK);
+    const int callback = luaL_ref(L, LUA_REGISTRYINDEX);
+
+    // Body
+    struct Http_client **client = lua_newuserdata(L, sizeof(*client));
+    check_alloc(client);
+
+    luaL_getmetatable(L, METATABLE_HTTP);
+    lua_setmetatable(L, -2);
+
+    *client = http_client_create(callback, L);
+    if (!*client) {
+        luaL_unref(L, LUA_REGISTRYINDEX, callback);
+        return luaL_error(L, "failed to create http client");
+    }
+    // Epilogue. The userdata (http client) was already pushed to the stack by the above code.
+    return 1;
+}
+
 static const struct luaL_Reg lua_lib[] = {
     // public (see api.lua)
     {"active_res", l_active_res},
@@ -1236,6 +1353,7 @@ static const struct luaL_Reg lua_lib[] = {
     {"text", l_text},
     {"toggle_fullscreen", l_toggle_fullscreen},
     {"irc_client_create", l_irc_client},
+    {"http_client_create", l_http_client},
 
     // private (see init.lua)
     {"log", l_log},
@@ -1288,6 +1406,16 @@ config_api_init(struct config_vm *vm) {
     lua_pushcfunction(vm->L, irc_client_index); // stack: n+3
     lua_settable(vm->L, -3);                    // stack: n+1
     lua_pop(vm->L, 1);                          // stack: n
+
+    // Create the metatable for "irc_client" objects.
+    luaL_newmetatable(vm->L, METATABLE_HTTP);    // stack: n+1
+    lua_pushstring(vm->L, "__gc");               // stack: n+2
+    lua_pushcfunction(vm->L, http_client_gc);    // stack: n+3
+    lua_settable(vm->L, -3);                     // stack: n+1
+    lua_pushstring(vm->L, "__index");            // stack: n+2
+    lua_pushcfunction(vm->L, http_client_index); // stack: n+3
+    lua_settable(vm->L, -3);                     // stack: n+1
+    lua_pop(vm->L, 1);                           // stack: n
 
     for (size_t i = 0; i < STATIC_ARRLEN(EMBEDDED_LUA); i++) {
         if (config_vm_exec_bcode(vm, EMBEDDED_LUA[i].data, EMBEDDED_LUA[i].size,

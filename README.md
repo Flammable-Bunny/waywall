@@ -41,6 +41,7 @@ The following dependencies are required for both building and running:
  - `xwayland`
  - `xkbcommon`
  - `freetype2`
+ - `libcurl`
  - `libircclient`
 
 To build waywall, clone the repository and run `make`.

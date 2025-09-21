@@ -1,6 +1,7 @@
 #include "server/server.h"
 
 #include "config/config.h"
+#include "http.h"
 #include "irc.h"
 #include "server/backend.h"
 #include "server/cursor.h"
@@ -147,7 +148,11 @@ backend_display_tick(int fd, uint32_t mask, void *data) {
         return 0;
     }
 
+    // irc client poll
     manage_new_messages();
+
+    // http client poll
+    manage_new_responses();
 
     return num_dispatched > 0;
 }

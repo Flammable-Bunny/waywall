@@ -14,6 +14,11 @@
 #include <GLES2/gl2.h>
 #include <ft2build.h>
 #include <spng.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/types.h>
 #include FT_FREETYPE_H
 
@@ -38,6 +43,8 @@ struct scene_object {
     struct scene *parent;
     enum scene_object_type type;
     int32_t depth;
+
+    bool enabled;
 };
 
 struct scene_image {
@@ -456,6 +463,11 @@ text_build(GLuint vbo, struct scene *scene, const char *data, const size_t data_
             continue;
         }
 
+        if (g.character == '\2') {
+            x += options->size;
+            continue;
+        }
+
         struct box src = {
             .x = g.atlas_x,
             .y = g.atlas_y,
@@ -751,17 +763,21 @@ draw_frame(struct scene *scene) {
     glDisable(GL_STENCIL_TEST);
 
     wl_list_for_each (object, &scene->objects.unsorted_mirrors, link) {
-        mirror_render(object);
+        if (object->enabled)
+            mirror_render(object);
     }
     wl_list_for_each (object, &scene->objects.unsorted_images, link) {
-        image_render(object);
+        if (object->enabled)
+            image_render(object);
     }
     wl_list_for_each (object, &scene->objects.unsorted_text, link) {
-        text_render(object);
+        if (object->enabled)
+            text_render(object);
     }
     if (positive_depth) {
         wl_list_for_each (object, positive_depth, link) {
-            object_render(object);
+            if (object->enabled)
+                object_render(object);
         }
     }
 
@@ -851,8 +867,8 @@ scene_text_from_object(struct scene_object *object) {
 }
 
 static bool
-image_load(struct scene_image *out, struct scene *scene, const char *path) {
-    struct util_png png = util_png_decode(path, scene->image_max_size);
+image_load(struct scene_image *out, struct scene *scene, const char *data, const size_t size) {
+    struct util_png png = util_png_decode(data, size, scene->image_max_size);
     if (!png.data) {
         return false;
     }
@@ -996,17 +1012,26 @@ scene_destroy(struct scene *scene) {
 
     wl_list_remove(&scene->on_gl_frame.link);
 
+    FT_Done_Face(scene->font.face);
+    FT_Done_FreeType(scene->font.ft);
+
+    for (size_t i = 0; i < scene->font.fonts_len; i++)
+        free(scene->font.fonts[i].glyphs);
+
+    free(scene->font.fonts);
+
     free(scene);
 }
 
 struct scene_image *
-scene_add_image(struct scene *scene, const struct scene_image_options *options, const char *path) {
+scene_add_image(struct scene *scene, const struct scene_image_options *options, const char *data,
+                const size_t size) {
     struct scene_image *image = zalloc(1, sizeof(*image));
 
     image->parent = scene;
 
     // Load the PNG into an OpenGL texture.
-    if (!image_load(image, scene, path)) {
+    if (!image_load(image, scene, data, size)) {
         free(image);
         return NULL;
     }
@@ -1019,6 +1044,8 @@ scene_add_image(struct scene *scene, const struct scene_image_options *options, 
 
     image->object.depth = options->depth;
     object_add(scene, (struct scene_object *)image, SCENE_OBJECT_IMAGE);
+
+    image->object.enabled = true;
 
     return image;
 }
@@ -1038,6 +1065,8 @@ scene_add_mirror(struct scene *scene, const struct scene_mirror_options *options
 
     mirror->object.depth = options->depth;
     object_add(scene, (struct scene_object *)mirror, SCENE_OBJECT_MIRROR);
+
+    mirror->object.enabled = true;
 
     return mirror;
 }
@@ -1069,7 +1098,19 @@ scene_add_text(struct scene *scene, const char *data, const struct scene_text_op
     text->object.depth = options->depth;
     object_add(scene, (struct scene_object *)text, SCENE_OBJECT_TEXT);
 
+    text->object.enabled = true;
+
     return text;
+}
+
+void
+scene_object_show(struct scene_object *object) {
+    object->enabled = true;
+}
+
+void
+scene_object_hide(struct scene_object *object) {
+    object->enabled = false;
 }
 
 void

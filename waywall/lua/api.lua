@@ -159,4 +159,8 @@ M.toggle_fullscreen = priv.toggle_fullscreen
 -- @return irc-client The irc client object, can be used to close the connection and send messages.
 M.irc_client_create = priv.irc_client_create
 
+--- Create a http client
+-- @param callback The function that will be called when the message is recieved.
+M.http_client_create = priv.http_client_create
+
 package.loaded["waywall"] = M

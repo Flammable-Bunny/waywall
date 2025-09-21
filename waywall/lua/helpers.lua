@@ -68,17 +68,24 @@ M.res_image = function(path, options, width, height)
 
         if active_width == width and active_height == height then
             if image then
+                image:show()
                 return
             end
+            local file, err = io.open(path, "rb")
+            if not file then
+                return nil, err
+            end
 
-            image = waywall.image(path, options)
+            local content = file:read("*all")
+            file:close()
+
+            image = waywall.image(content, options)
         else
             if not image then
                 return
             end
 
-            image:close()
-            image = nil
+            image:hide()
         end
     end)
 end

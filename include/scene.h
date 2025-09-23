@@ -6,6 +6,7 @@
 #include <GLES2/gl2.h>
 #include <ft2build.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <sys/types.h>
 #include <wayland-server-core.h>
 #include <wayland-util.h>
@@ -31,9 +32,11 @@ struct glyph_metadata {
 
     // atlas position
     int atlas_x, atlas_y;
-    GLuint tex;
 
     uint32_t character;
+
+    bool needs_gpu_upload;
+    unsigned char *bitmap_data;
 };
 
 // all glyphs for a given font size in a dynamic atlas
@@ -51,6 +54,11 @@ struct font_size_obj {
     int atlas_x;
     int atlas_y;
     int atlas_row_height;
+};
+
+struct Custom_atlas {
+    GLuint tex;
+    u_int32_t width;
 };
 
 struct scene {
@@ -98,6 +106,9 @@ struct scene {
         struct font_size_obj *fonts; // array of font sizes
         size_t fonts_len;
     } font;
+
+    struct Custom_atlas *atlas_arr;
+    size_t atlas_arr_len;
 };
 
 struct scene_shader {
@@ -109,6 +120,16 @@ struct scene_shader {
 
 struct scene_image_options {
     struct box dst;
+
+    int32_t depth;
+    char *shader_name;
+};
+
+struct scene_image_from_atlas_options {
+    struct box dst;
+    struct box src;
+
+    struct Custom_atlas *atlas;
 
     int32_t depth;
     char *shader_name;
@@ -132,6 +153,8 @@ struct scene_text_options {
 
     int32_t depth;
     char *shader_name;
+
+    int32_t line_spacing;
 };
 
 struct scene_object;
@@ -140,16 +163,32 @@ struct scene *scene_create(struct config *cfg, struct server_gl *gl, struct serv
 void scene_destroy(struct scene *scene);
 
 struct scene_image *scene_add_image(struct scene *scene, const struct scene_image_options *options,
-                                    const char *path, const size_t size);
+                                    const char *path);
+struct scene_image *
+scene_add_image_from_atlas(struct scene *scene,
+                           const struct scene_image_from_atlas_options *options);
 struct scene_mirror *scene_add_mirror(struct scene *scene,
                                       const struct scene_mirror_options *options);
 struct scene_text *scene_add_text(struct scene *scene, const char *data,
                                   const struct scene_text_options *options);
+struct Custom_atlas *scene_create_atlas(struct scene *scene, const uint32_t width);
+
+void scene_atlas_raw_image(struct scene *scene, struct Custom_atlas *atlas, const char *data,
+                           size_t data_len, u_int32_t x, uint32_t y);
+void scene_atlas_destroy(struct Custom_atlas *atlas);
 
 void scene_object_destroy(struct scene_object *object);
 int32_t scene_object_get_depth(struct scene_object *object);
 void scene_object_set_depth(struct scene_object *object, int32_t depth);
 void scene_object_hide(struct scene_object *object);
 void scene_object_show(struct scene_object *object);
+
+struct advance_ret {
+    int32_t x;
+    int32_t y;
+};
+
+struct advance_ret text_get_advance(struct scene *scene, const char *data, const size_t data_len,
+                                    const u_int32_t size);
 
 #endif

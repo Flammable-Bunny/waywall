@@ -159,8 +159,21 @@ M.toggle_fullscreen = priv.toggle_fullscreen
 -- @return irc-client The irc client object, can be used to close the connection and send messages.
 M.irc_client_create = priv.irc_client_create
 
---- Create a http client
+--- Creates a http client
 -- @param callback The function that will be called when the message is recieved.
 M.http_client_create = priv.http_client_create
+
+--- Creates a atlas which can be used to store images
+-- @param width The width (in pixels) of the atlas
+M.atlas = priv.atlas
+
+--- Creates a image from a location on a atlas
+-- @param options The options table for the image
+M.image_a = priv.image_a
+
+--- Finds the x and y advance length for a string when using a givin font size.
+-- @param text The text to find the advance of
+-- @param size The font size to use
+M.text_advance = priv.text_advance
 
 package.loaded["waywall"] = M

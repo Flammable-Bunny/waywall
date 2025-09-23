@@ -71,15 +71,8 @@ M.res_image = function(path, options, width, height)
                 image:show()
                 return
             end
-            local file, err = io.open(path, "rb")
-            if not file then
-                return nil, err
-            end
 
-            local content = file:read("*all")
-            file:close()
-
-            image = waywall.image(content, options)
+            image = waywall.image(path, options)
         else
             if not image then
                 return

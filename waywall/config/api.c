@@ -23,6 +23,7 @@
 #include <luajit-2.1/lauxlib.h>
 #include <luajit-2.1/lua.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -81,6 +82,7 @@ static const struct {
 #define METATABLE_TEXT "waywall.text"
 #define METATABLE_IRC "waywall.irc"
 #define METATABLE_HTTP "waywall.http"
+#define METATABLE_ATLAS "waywall.atlas"
 
 #define STARTUP_ERRMSG(function) function " cannot be called during startup"
 
@@ -378,6 +380,66 @@ http_client_gc(lua_State *L) {
     return 0;
 }
 
+static int
+atlas_close_(lua_State *L) {
+    struct Custom_atlas **atlas = lua_touserdata(L, 1);
+
+    if (!*atlas) {
+        return luaL_error(L, "cannot close atlas more than once");
+    }
+
+    scene_atlas_destroy(*atlas);
+    *atlas = NULL;
+
+    return 0;
+}
+
+static int
+atlas_raw(lua_State *L) {
+
+    struct config_vm *vm = config_vm_from(L);
+    struct wrap *wrap = config_vm_get_wrap(vm);
+    struct Custom_atlas **atlas = lua_touserdata(L, 1);
+
+    size_t data_size;
+    const char *data = luaL_checklstring(L, 2, &data_size);
+
+    const int x = luaL_checkinteger(L, 3);
+    const int y = luaL_checkinteger(L, 4);
+
+    scene_atlas_raw_image(wrap->scene, *atlas, data, data_size, x, y);
+
+    return 0;
+}
+
+static int
+atlas_index(lua_State *L) {
+    const char *key = luaL_checkstring(L, 2);
+
+    if (strcmp(key, "close") == 0) {
+        lua_pushcfunction(L, atlas_close_);
+    } else if (strcmp(key, "insert_raw") == 0) {
+        lua_pushcfunction(L, atlas_raw);
+    } else {
+        lua_pushnil(L);
+    }
+
+    return 1;
+}
+
+static int
+atlas_gc(lua_State *L) {
+    struct Custom_atlas **atlas = lua_touserdata(L, 1);
+
+    if (*atlas) {
+        scene_atlas_destroy(*atlas);
+    }
+
+    *atlas = NULL;
+
+    return 0;
+}
+
 static void
 waker_sleep_vm_destroy(struct config_vm_waker *vm_waker, void *data) {
     struct waker_sleep *waker = data;
@@ -575,7 +637,7 @@ l_floating_shown(lua_State *L) {
 
 static int
 l_image(lua_State *L) {
-    static const int ARG_DATA = 1;
+    static const int ARG_PATH = 1;
     static const int ARG_OPTIONS = 2;
 
     // Prologue
@@ -585,9 +647,7 @@ l_image(lua_State *L) {
         return luaL_error(L, STARTUP_ERRMSG("image"));
     }
 
-    size_t data_size;
-    // use checklstring because bin data
-    const char *data = luaL_checklstring(L, ARG_DATA, &data_size);
+    const char *path = luaL_checkstring(L, ARG_PATH);
     luaL_checktype(L, ARG_OPTIONS, LUA_TTABLE);
     lua_settop(L, ARG_OPTIONS);
 
@@ -617,7 +677,63 @@ l_image(lua_State *L) {
     luaL_getmetatable(L, METATABLE_IMAGE);
     lua_setmetatable(L, -2);
 
-    *image = scene_add_image(wrap->scene, &options, data, data_size);
+    *image = scene_add_image(wrap->scene, &options, path);
+    free(options.shader_name);
+    if (!*image) {
+        return luaL_error(L, "failed to create image from PNG at '%s'", path);
+    }
+
+    // Epilogue. The userdata (image) was already pushed to the stack by the above code.
+    return 1;
+}
+
+static int
+l_image_from_atlas(lua_State *L) {
+    static const int ARG_OPTIONS = 1;
+
+    // Prologue
+    struct config_vm *vm = config_vm_from(L);
+    struct wrap *wrap = config_vm_get_wrap(vm);
+    if (!wrap) {
+        return luaL_error(L, STARTUP_ERRMSG("image"));
+    }
+
+    struct scene_image_from_atlas_options options = {0};
+    unmarshal_box_key(L, "dst", &options.dst);
+    unmarshal_box_key(L, "src", &options.src);
+
+    lua_pushstring(L, "shader");
+    lua_rawget(L, ARG_OPTIONS);
+    if (lua_type(L, -1) == LUA_TSTRING) {
+        options.shader_name = strdup(lua_tostring(L, -1));
+    }
+    lua_pop(L, 1);
+
+    lua_pushstring(L, "depth");
+    lua_rawget(L, ARG_OPTIONS);
+    if (lua_type(L, -1) == LUA_TNUMBER) {
+        options.depth = lua_tointeger(L, -1);
+    } else {
+        options.depth = DEFAULT_DEPTH;
+    }
+    lua_pop(L, 1);
+
+    lua_pushstring(L, "atlas");
+    lua_rawget(L, ARG_OPTIONS);
+    struct Custom_atlas **atlas_ptr = lua_touserdata(L, -1);
+    if (!atlas_ptr || !*atlas_ptr) {
+        return luaL_error(L, "invalid atlas");
+    }
+    options.atlas = *atlas_ptr; // Dereference to get the actual atlas
+    lua_pop(L, 1);              // Body
+
+    struct scene_image **image = lua_newuserdata(L, sizeof(*image));
+    check_alloc(image);
+
+    luaL_getmetatable(L, METATABLE_IMAGE);
+    lua_setmetatable(L, -2);
+
+    *image = scene_add_image_from_atlas(wrap->scene, &options);
     free(options.shader_name);
     if (!*image) {
         return luaL_error(L, "failed to create image");
@@ -1167,6 +1283,15 @@ l_text(lua_State *L) {
     }
     lua_pop(L, 1);
 
+    lua_pushstring(L, "ls");
+    lua_rawget(L, ARG_OPTIONS);
+    if (lua_type(L, -1) == LUA_TNUMBER) {
+        options.line_spacing = lua_tointeger(L, -1);
+    } else {
+        options.line_spacing = 0;
+    }
+    lua_pop(L, 1);
+
     // Body
     struct scene_text **text = lua_newuserdata(L, sizeof(*text));
     check_alloc(text);
@@ -1181,6 +1306,35 @@ l_text(lua_State *L) {
     }
 
     // Epilogue. The userdata (text) was already pushed to the stack by the above code.
+    return 1;
+}
+
+static int
+l_text_advance(lua_State *L) {
+    static const int ARG_TEXT = 1;
+    static const int ARG_SIZE = 2;
+
+    // Prologue
+    struct config_vm *vm = config_vm_from(L);
+    struct wrap *wrap = config_vm_get_wrap(vm);
+    if (!wrap) {
+        return luaL_error(L, STARTUP_ERRMSG("text"));
+    }
+
+    size_t data_size = 0;
+
+    const char *data = luaL_checklstring(L, ARG_TEXT, &data_size);
+    const int size = luaL_checkinteger(L, ARG_SIZE);
+
+    // Body
+    const struct advance_ret advance = text_get_advance(wrap->scene, data, data_size, size);
+
+    // Epilogue
+    lua_newtable(L);
+    lua_pushinteger(L, advance.x);
+    lua_setfield(L, -2, "x");
+    lua_pushinteger(L, advance.y);
+    lua_setfield(L, -2, "y");
     return 1;
 }
 
@@ -1332,6 +1486,34 @@ l_http_client(lua_State *L) {
     return 1;
 }
 
+static int
+l_atlas(lua_State *L) {
+    static const int ARG_WIDTH = 1;
+
+    // Prologue
+    struct config_vm *vm = config_vm_from(L);
+    struct wrap *wrap = config_vm_get_wrap(vm);
+    if (!wrap) {
+        return luaL_error(L, STARTUP_ERRMSG("atlas"));
+    }
+
+    const int width = luaL_checkinteger(L, ARG_WIDTH);
+
+    // Body
+    struct Custom_atlas **atlas = lua_newuserdata(L, sizeof(*atlas));
+    check_alloc(atlas);
+
+    luaL_getmetatable(L, METATABLE_ATLAS);
+    lua_setmetatable(L, -2);
+
+    *atlas = scene_create_atlas(wrap->scene, width);
+    if (!*atlas) {
+        return luaL_error(L, "failed to init atlas");
+    }
+    // Epilogue. The userdata atlas was already pushed to the stack by the above code.
+    return 1;
+}
+
 static const struct luaL_Reg lua_lib[] = {
     // public (see api.lua)
     {"active_res", l_active_res},
@@ -1354,6 +1536,9 @@ static const struct luaL_Reg lua_lib[] = {
     {"toggle_fullscreen", l_toggle_fullscreen},
     {"irc_client_create", l_irc_client},
     {"http_client_create", l_http_client},
+    {"atlas", l_atlas},
+    {"image_a", l_image_from_atlas},
+    {"text_advance", l_text_advance},
 
     // private (see init.lua)
     {"log", l_log},
@@ -1407,7 +1592,7 @@ config_api_init(struct config_vm *vm) {
     lua_settable(vm->L, -3);                    // stack: n+1
     lua_pop(vm->L, 1);                          // stack: n
 
-    // Create the metatable for "irc_client" objects.
+    // Create the metatable for "http" objects.
     luaL_newmetatable(vm->L, METATABLE_HTTP);    // stack: n+1
     lua_pushstring(vm->L, "__gc");               // stack: n+2
     lua_pushcfunction(vm->L, http_client_gc);    // stack: n+3
@@ -1416,6 +1601,16 @@ config_api_init(struct config_vm *vm) {
     lua_pushcfunction(vm->L, http_client_index); // stack: n+3
     lua_settable(vm->L, -3);                     // stack: n+1
     lua_pop(vm->L, 1);                           // stack: n
+
+    // Create the metatable for "atlas" objects.
+    luaL_newmetatable(vm->L, METATABLE_ATLAS); // stack: n+1
+    lua_pushstring(vm->L, "__gc");             // stack: n+2
+    lua_pushcfunction(vm->L, atlas_gc);        // stack: n+3
+    lua_settable(vm->L, -3);                   // stack: n+1
+    lua_pushstring(vm->L, "__index");          // stack: n+2
+    lua_pushcfunction(vm->L, atlas_index);     // stack: n+3
+    lua_settable(vm->L, -3);                   // stack: n+1
+    lua_pop(vm->L, 1);                         // stack: n
 
     for (size_t i = 0; i < STATIC_ARRLEN(EMBEDDED_LUA); i++) {
         if (config_vm_exec_bcode(vm, EMBEDDED_LUA[i].data, EMBEDDED_LUA[i].size,

@@ -176,6 +176,7 @@ response_queue_cleanup(struct response_queue *q) {
     for (int i = 0; i < MAX_QUEUED_RESPONSES; i++) {
         if (q->responses[i]) {
             free(q->responses[i]->data);
+            free(q->responses[i]->url);
             free(q->responses[i]);
             q->responses[i] = NULL;
         }

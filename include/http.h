@@ -6,7 +6,7 @@
 #include <stdbool.h>
 
 #define MAX_CLIENTS 8
-#define MAX_QUEUED_RESPONSES 64
+#define MAX_QUEUED_RESPONSES 256
 #define MAX_RESPONSE_LENGTH 8192
 
 struct queued_response {

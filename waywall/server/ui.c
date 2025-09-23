@@ -114,10 +114,9 @@ color_buffer_new(struct server *server, const uint8_t color[static 4]) {
     return bg_buffer_create(server, data, 1, 1);
 }
 
-/*
 static struct wl_buffer *
-image_buffer_new(struct server *server, const char *path, const size_t size) {
-    struct util_png png = util_png_decode(path, size, 16384); // arbitrary max size
+image_buffer_new(struct server *server, const char *path) {
+    struct util_png png = util_png_decode(path, 16384); // arbitrary max size
     if (!png.data) {
         return NULL;
     }
@@ -142,7 +141,6 @@ image_buffer_new(struct server *server, const char *path, const size_t size) {
 
     return bg_buffer_create(server, data, png.width, png.height);
 }
-*/
 
 static void
 layout_centered(struct server_view *view) {
@@ -495,7 +493,11 @@ struct server_ui_config *
 server_ui_config_create(struct server_ui *ui, struct config *cfg) {
     struct server_ui_config *config = zalloc(1, sizeof(*config));
 
-    config->background = color_buffer_new(ui->server, cfg->theme.background);
+    if (*cfg->theme.background_path) {
+        config->background = image_buffer_new(ui->server, cfg->theme.background_path);
+    } else {
+        config->background = color_buffer_new(ui->server, cfg->theme.background);
+    }
 
     if (!config->background) {
         ww_log(LOG_ERROR, "failed to create background buffer");

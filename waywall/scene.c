@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
+#include <wayland-util.h>
 #include FT_FREETYPE_H
 
 #define FONT_ATLAS_WIDTH 1024
@@ -56,6 +57,8 @@ struct scene_image {
     GLuint tex, vbo;
 
     int32_t width, height;
+
+    bool is_atlas_texture;
 };
 
 struct scene_mirror {
@@ -79,6 +82,7 @@ struct scene_text {
     size_t vtxcount;
 
     int32_t x, y;
+    uint32_t font_size;
 };
 
 static void object_add(struct scene *scene, struct scene_object *object,
@@ -117,12 +121,32 @@ image_build(struct scene_image *out, struct scene *scene, const struct scene_ima
 }
 
 static void
+image_build_from_atlas(struct scene_image *out, struct scene *scene,
+                       const struct scene_image_from_atlas_options *options) {
+    struct vtx_shader vertices[6] = {0};
+
+    rect_build(vertices, &options->src, &options->dst, (float[4]){0, 0, 0, 0},
+               (float[4]){0, 0, 0, 0});
+
+    server_gl_with(scene->gl, false) {
+        glGenBuffers(1, &out->vbo);
+        ww_assert(out->vbo != 0);
+
+        gl_using_buffer(GL_ARRAY_BUFFER, out->vbo) {
+            glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
+        }
+    }
+}
+
+static void
 image_release(struct scene_object *object) {
     struct scene_image *image = scene_image_from_object(object);
 
     if (image->parent) {
         server_gl_with(image->parent->gl, false) {
-            glDeleteTextures(1, &image->tex);
+            if (!image->is_atlas_texture) {
+                glDeleteTextures(1, &image->tex);
+            }
             glDeleteBuffers(1, &image->vbo);
         }
     }
@@ -289,17 +313,14 @@ get_glyph(struct scene *scene, const uint32_t c, const size_t font_height) {
     if (font_size_obj->atlas_y + data.height > font_size_obj->atlas_height)
         ww_panic("Atlas full, cannot add glyph U+%04X\n", c);
 
-    // copy glyph into atlas
-    gl_using_texture(GL_TEXTURE_2D, font_size_obj->atlas_tex) {
-        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-        glTexSubImage2D(GL_TEXTURE_2D, 0, font_size_obj->atlas_x, font_size_obj->atlas_y,
-                        data.width, data.height, GL_ALPHA, GL_UNSIGNED_BYTE, buffer);
-    }
-
     data.atlas_x = font_size_obj->atlas_x;
     data.atlas_y = font_size_obj->atlas_y;
 
-    data.tex = font_size_obj->atlas_tex;
+    data.needs_gpu_upload = true;
+    data.bitmap_data = malloc(data.width * data.height);
+    if (data.bitmap_data && buffer) {
+        memcpy(data.bitmap_data, buffer, data.width * data.height);
+    }
 
     // update atlas placement
     font_size_obj->atlas_x += data.width;
@@ -378,12 +399,7 @@ parse_color(const u_int32_t *s, float rgba[4]) {
     return 0;
 }
 
-struct text_build_ret {
-    size_t vertex_count;
-    GLuint tex;
-};
-
-static struct text_build_ret
+static size_t
 text_build(GLuint vbo, struct scene *scene, const char *data, const size_t data_len,
            const struct scene_text_options *options) {
     // The OpenGL context must be current.
@@ -458,13 +474,8 @@ text_build(GLuint vbo, struct scene *scene, const char *data, const size_t data_
         const struct glyph_metadata g = glyphs[i];
 
         if (g.character == '\n') {
-            y += options->size;
+            y += options->size + options->line_spacing;
             x = options->x;
-            continue;
-        }
-
-        if (g.character == '\2') {
-            x += options->size;
             continue;
         }
 
@@ -493,13 +504,87 @@ text_build(GLuint vbo, struct scene *scene, const char *data, const size_t data_
         glBufferData(GL_ARRAY_BUFFER, vtxcount * sizeof(*vertices), vertices, GL_STATIC_DRAW);
     }
 
-    struct text_build_ret ret = {.vertex_count = vtxcount, .tex = glyphs->tex};
-
     free(text_chars);
     free(glyphs);
     free(vertices);
 
-    return ret;
+    return vtxcount;
+}
+
+struct advance_ret
+text_get_advance(struct scene *scene, const char *data, const size_t data_len,
+                 const u_int32_t size) {
+
+    // decode utf8
+    size_t capacity = 16;
+    size_t next_index = 0;
+    u_int32_t *cps = zalloc(capacity, sizeof(u_int32_t));
+    const char *c = data;
+    while (*c != '\0') {
+        if (next_index >= capacity) {
+            capacity *= 2;
+            u_int32_t *tmp = realloc(cps, capacity * sizeof(u_int32_t));
+            if (tmp == NULL) {
+                ww_panic("Out of memory");
+            }
+            cps = tmp;
+        }
+        cps[next_index++] = utf8_decode(&c);
+    }
+
+    const size_t cps_len = next_index;
+
+    // remove color tags
+    next_index = 0;
+    capacity = 16;
+    u_int32_t *text_chars = zalloc(16, sizeof(u_int32_t));
+
+    for (size_t i = 0; i < cps_len; i++) {
+        if (i + 1 < cps_len && cps[i] == '<' && cps[i + 1] == '#') {
+            // <#FFFFFFFF>
+            if (cps_len - i >= 11) {
+                float dummy_color[4];
+                if (parse_color(cps + i + 2, dummy_color) == 0 && cps[i + 10] == '>') {
+                    i += 10;
+                    continue;
+                }
+            }
+        }
+        if (next_index >= capacity) {
+            capacity *= 2;
+            u_int32_t *tmp = realloc(text_chars, capacity * sizeof(u_int32_t));
+            if (tmp == NULL) {
+                ww_panic("Out of memory");
+            }
+            text_chars = tmp;
+        }
+        text_chars[next_index++] = cps[i];
+    }
+
+    free(cps);
+    const size_t character_count = next_index;
+
+    // calculate width
+    int32_t x = 0;
+    int32_t y = 0;
+
+    for (size_t i = 0; i < character_count; i++) {
+        const uint32_t ch = text_chars[i];
+
+        if (ch == '\n') {
+            x = 0;
+            y += size;
+            continue;
+        }
+
+        struct glyph_metadata glyph = get_glyph(scene, ch, size);
+
+        x += (int)(glyph.advance >> 6);
+    }
+
+    free(text_chars);
+
+    return (struct advance_ret){.x = x, .y = y};
 }
 
 static void
@@ -516,11 +601,57 @@ text_release(struct scene_object *object) {
 }
 
 static void
+upload_pending_glyphs(struct scene *scene, struct font_size_obj *font_obj) {
+    bool has_pending = false;
+
+    for (size_t i = 0; i < font_obj->next_glyph_index; i++) {
+        if (font_obj->glyphs[i].needs_gpu_upload) {
+            has_pending = true;
+            break;
+        }
+    }
+
+    if (!has_pending)
+        return;
+
+    gl_using_texture(GL_TEXTURE_2D, font_obj->atlas_tex) {
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+
+        for (size_t i = 0; i < font_obj->next_glyph_index; i++) {
+            struct glyph_metadata *glyph = &font_obj->glyphs[i];
+
+            if (glyph->needs_gpu_upload && glyph->bitmap_data) {
+                glTexSubImage2D(GL_TEXTURE_2D, 0, glyph->atlas_x, glyph->atlas_y, glyph->width,
+                                glyph->height, GL_ALPHA, GL_UNSIGNED_BYTE, glyph->bitmap_data);
+
+                // Clean up
+                free(glyph->bitmap_data);
+                glyph->bitmap_data = NULL;
+                glyph->needs_gpu_upload = false;
+            }
+        }
+    }
+}
+
+static void
 text_render(struct scene_object *object) {
     // The OpenGL context must be current.
-
     struct scene_text *text = scene_text_from_object(object);
     struct scene *scene = text->parent;
+
+    // find font obj
+    struct font_size_obj *font_obj = NULL;
+    for (size_t i = 0; i < scene->font.fonts_len; i++) {
+        if (scene->font.fonts[i].font_height == text->font_size) {
+            font_obj = &scene->font.fonts[i];
+            break;
+        }
+    }
+
+    if (!font_obj)
+        return;
+
+    upload_pending_glyphs(scene, font_obj);
 
     server_gl_shader_use(scene->shaders.data[text->shader_index].shader);
     glUniform2f(scene->shaders.data[text->shader_index].shader_u_dst_size, scene->ui->width,
@@ -529,12 +660,11 @@ text_render(struct scene_object *object) {
                 FONT_ATLAS_HEIGHT);
 
     gl_using_buffer(GL_ARRAY_BUFFER, text->vbo) {
-        gl_using_texture(GL_TEXTURE_2D, text->tex) {
+        gl_using_texture(GL_TEXTURE_2D, font_obj->atlas_tex) {
             draw_vertex_list(&scene->shaders.data[text->shader_index], text->vtxcount);
         }
     }
 }
-
 static void
 on_gl_frame(struct wl_listener *listener, void *data) {
     struct scene *scene = wl_container_of(listener, scene, on_gl_frame);
@@ -703,14 +833,20 @@ draw_debug_text(struct scene *scene) {
     glUniform2f(scene->shaders.data[1].shader_u_src_size, FONT_ATLAS_WIDTH, FONT_ATLAS_HEIGHT);
 
     const char *str = util_debug_str();
-    const struct text_build_ret ret =
+    scene->buffers.debug_vtxcount =
         text_build(scene->buffers.debug, scene, str, strlen(str),
                    &(struct scene_text_options){.x = 8, .y = 8, .size = 20, .shader_name = NULL});
 
-    scene->buffers.debug_vtxcount = ret.vertex_count;
+    GLuint atlas_texture = 0;
+    for (size_t i = 0; i < scene->font.fonts_len; i++) {
+        if (scene->font.fonts[i].font_height == 20) {
+            atlas_texture = scene->font.fonts[i].atlas_tex;
+            break;
+        }
+    }
 
     gl_using_buffer(GL_ARRAY_BUFFER, scene->buffers.debug) {
-        gl_using_texture(GL_TEXTURE_2D, ret.tex) {
+        gl_using_texture(GL_TEXTURE_2D, atlas_texture) {
             draw_vertex_list(&scene->shaders.data[1], scene->buffers.debug_vtxcount);
         }
     }
@@ -867,8 +1003,8 @@ scene_text_from_object(struct scene_object *object) {
 }
 
 static bool
-image_load(struct scene_image *out, struct scene *scene, const char *data, const size_t size) {
-    struct util_png png = util_png_decode(data, size, scene->image_max_size);
+image_load(struct scene_image *out, struct scene *scene, const char *path) {
+    struct util_png png = util_png_decode(path, scene->image_max_size);
     if (!png.data) {
         return false;
     }
@@ -1015,23 +1151,30 @@ scene_destroy(struct scene *scene) {
     FT_Done_Face(scene->font.face);
     FT_Done_FreeType(scene->font.ft);
 
-    for (size_t i = 0; i < scene->font.fonts_len; i++)
-        free(scene->font.fonts[i].glyphs);
-
+    for (size_t i = 0; i < scene->font.fonts_len; i++) {
+        struct font_size_obj *font_obj = &scene->font.fonts[i];
+        for (size_t j = 0; j < font_obj->next_glyph_index; j++) {
+            if (font_obj->glyphs[j].bitmap_data) {
+                free(font_obj->glyphs[j].bitmap_data);
+                font_obj->glyphs[j].bitmap_data = NULL;
+            }
+        }
+        free(font_obj->glyphs);
+    }
     free(scene->font.fonts);
 
     free(scene);
 }
 
 struct scene_image *
-scene_add_image(struct scene *scene, const struct scene_image_options *options, const char *data,
-                const size_t size) {
+scene_add_image(struct scene *scene, const struct scene_image_options *options, const char *path) {
     struct scene_image *image = zalloc(1, sizeof(*image));
 
     image->parent = scene;
+    image->is_atlas_texture = false;
 
     // Load the PNG into an OpenGL texture.
-    if (!image_load(image, scene, data, size)) {
+    if (!image_load(image, scene, path)) {
         free(image);
         return NULL;
     }
@@ -1041,6 +1184,31 @@ scene_add_image(struct scene *scene, const struct scene_image_options *options, 
 
     // Build a vertex buffer containing the data for this image.
     image_build(image, scene, options, image->width, image->height);
+
+    image->object.depth = options->depth;
+    object_add(scene, (struct scene_object *)image, SCENE_OBJECT_IMAGE);
+
+    image->object.enabled = true;
+
+    return image;
+}
+
+struct scene_image *
+scene_add_image_from_atlas(struct scene *scene,
+                           const struct scene_image_from_atlas_options *options) {
+    struct scene_image *image = zalloc(1, sizeof(*image));
+
+    image->parent = scene;
+    image->tex = options->atlas->tex;
+
+    image->width = options->atlas->width;
+    image->height = options->atlas->width;
+
+    image->is_atlas_texture = true;
+
+    image->shader_index = shader_find_index(scene, options->shader_name);
+
+    image_build_from_atlas(image, scene, options);
 
     image->object.depth = options->depth;
     object_add(scene, (struct scene_object *)image, SCENE_OBJECT_IMAGE);
@@ -1078,6 +1246,7 @@ scene_add_text(struct scene *scene, const char *data, const struct scene_text_op
     text->parent = scene;
     text->x = options->x;
     text->y = options->y;
+    text->font_size = options->size;
 
     if (options->shader_name == NULL) {
         text->shader_index = 1;
@@ -1089,10 +1258,7 @@ scene_add_text(struct scene *scene, const char *data, const struct scene_text_op
         glGenBuffers(1, &text->vbo);
         ww_assert(text->vbo);
 
-        const struct text_build_ret ret = text_build(text->vbo, scene, data, strlen(data), options);
-
-        text->vtxcount = ret.vertex_count;
-        text->tex = ret.tex;
+        text->vtxcount = text_build(text->vbo, scene, data, strlen(data), options);
     }
 
     text->object.depth = options->depth;
@@ -1101,6 +1267,82 @@ scene_add_text(struct scene *scene, const char *data, const struct scene_text_op
     text->object.enabled = true;
 
     return text;
+}
+
+struct Custom_atlas *
+scene_create_atlas(struct scene *scene, const uint32_t width) {
+    // Allocate atlas individually, not in scene array
+    struct Custom_atlas *atlas = malloc(sizeof(struct Custom_atlas));
+    if (!atlas)
+        ww_panic("Failed to allocate atlas");
+
+    atlas->width = width;
+
+    unsigned char *atlasData = (unsigned char *)calloc(width * width * 4, 1);
+
+    server_gl_with(scene->gl, false) {
+        glGenTextures(1, &atlas->tex);
+        glBindTexture(GL_TEXTURE_2D, atlas->tex);
+
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, width, 0, GL_RGBA, GL_UNSIGNED_BYTE,
+                     atlasData);
+
+        glBindTexture(GL_TEXTURE_2D, 0);
+        free(atlasData);
+    }
+
+    return atlas;
+}
+
+void
+scene_atlas_raw_image(struct scene *scene, struct Custom_atlas *atlas, const char *data,
+                      size_t data_len, u_int32_t x, uint32_t y) {
+
+    struct util_png png = util_png_decode_raw(data, data_len, atlas->width);
+    if (!png.data)
+        return;
+
+    uint32_t blit_width = png.width;
+    uint32_t blit_height = png.height;
+
+    if (x + blit_width > atlas->width)
+        blit_width = atlas->width - x;
+    if (y + blit_height > atlas->width)
+        blit_height = atlas->width - y;
+
+    if (blit_width == 0 || blit_height == 0) {
+        free(png.data);
+        return;
+    }
+
+    server_gl_with(scene->gl, false) {
+        glBindTexture(GL_TEXTURE_2D, atlas->tex);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, blit_width, blit_height, GL_RGBA, GL_UNSIGNED_BYTE,
+                        png.data);
+        glBindTexture(GL_TEXTURE_2D, 0);
+
+        free(png.data);
+    }
+}
+
+void
+scene_atlas_destroy(struct Custom_atlas *atlas) {
+    if (!atlas)
+        return;
+
+    if (atlas->tex != 0) {
+        glDeleteTextures(1, &atlas->tex);
+        atlas->tex = 0;
+    }
+
+    atlas->width = 0;
+    free(atlas);
 }
 
 void

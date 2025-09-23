@@ -9,7 +9,6 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-
 struct util_png
 util_png_decode(const char *path, unsigned int max_size) {
     struct util_png result = {0};
@@ -67,8 +66,8 @@ util_png_decode(const char *path, unsigned int max_size) {
         goto fail_spng_decode_image;
     }
 
-    result.width = (int) ihdr.width;
-    result.height = (int) ihdr.height;
+    result.width = (int)ihdr.width;
+    result.height = (int)ihdr.height;
 
     spng_ctx_free(ctx);
     munmap(buf, stat.st_size);
@@ -94,7 +93,6 @@ fail_stat:
     result.data = NULL;
     return result;
 }
-
 
 struct util_png
 util_png_decode_raw(const char *data, size_t data_size, unsigned int max_size) {
@@ -135,8 +133,8 @@ util_png_decode_raw(const char *data, size_t data_size, unsigned int max_size) {
         goto fail_decode;
     }
 
-    result.width = (int) ihdr.width;
-    result.height = (int) ihdr.height;
+    result.width = (int)ihdr.width;
+    result.height = (int)ihdr.height;
 
     spng_ctx_free(ctx);
     return result;

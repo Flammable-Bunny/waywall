@@ -171,12 +171,12 @@ struct scene_mirror *scene_add_mirror(struct scene *scene,
                                       const struct scene_mirror_options *options);
 struct scene_text *scene_add_text(struct scene *scene, const char *data,
                                   const struct scene_text_options *options);
-struct Custom_atlas *scene_create_atlas(struct scene *scene, const uint32_t width);
-
+struct Custom_atlas *scene_create_atlas(struct scene *scene, const uint32_t width, const char *data,
+                                        size_t len);
 void scene_atlas_raw_image(struct scene *scene, struct Custom_atlas *atlas, const char *data,
                            size_t data_len, u_int32_t x, uint32_t y);
 void scene_atlas_destroy(struct Custom_atlas *atlas);
-
+char *atlas_get_dump(struct scene *scene, struct Custom_atlas *atlas, size_t *out_len);
 void scene_object_destroy(struct scene_object *object);
 int32_t scene_object_get_depth(struct scene_object *object);
 void scene_object_set_depth(struct scene_object *object, int32_t depth);

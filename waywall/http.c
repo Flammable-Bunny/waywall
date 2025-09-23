@@ -205,14 +205,10 @@ http_thread(void *arg) {
         return NULL;
     }
 
-    ww_log(LOG_INFO, "HTTP thread starting for client %d", client->index);
-
     while (!client->should_exit) {
         char *url = request_queue_pop(client);
         if (!url)
             break;
-
-        ww_log(LOG_INFO, "Processing HTTP request: %s", url);
 
         struct response_buffer response = {0};
 
@@ -244,7 +240,6 @@ http_thread(void *arg) {
         free(url);
     }
 
-    ww_log(LOG_INFO, "HTTP thread ending for client %d", client->index);
     return NULL;
 }
 
@@ -328,7 +323,6 @@ http_client_create(int callback, lua_State *L) {
     }
 
     client->thread_running = true;
-    ww_log(LOG_INFO, "HTTP client created successfully (slot %d)", slot);
     pthread_mutex_unlock(&clients_mutex);
     return client;
 }
@@ -346,15 +340,12 @@ http_client_get(struct Http_client *client, const char *url) {
     }
 
     request_queue_push(client, url);
-    ww_log(LOG_INFO, "HTTP GET request queued: %s", url);
 }
 
 void
 http_client_destroy(struct Http_client *client) {
     if (!client)
         return;
-
-    ww_log(LOG_INFO, "Destroying HTTP client %d", client->index);
 
     if (client->thread_running) {
         // Signal the thread to exit
@@ -390,8 +381,6 @@ http_client_destroy(struct Http_client *client) {
     pthread_mutex_unlock(&clients_mutex);
 
     free(client);
-    ww_log(LOG_INFO, "HTTP client destroyed");
-    ww_log(LOG_INFO, "%d pushed, %d popped.", pushed_count, popped_count);
 }
 
 void

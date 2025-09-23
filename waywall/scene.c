@@ -1270,36 +1270,70 @@ scene_add_text(struct scene *scene, const char *data, const struct scene_text_op
 }
 
 struct Custom_atlas *
-scene_create_atlas(struct scene *scene, const uint32_t width) {
-    // Allocate atlas individually, not in scene array
+scene_create_atlas(struct scene *scene, const uint32_t width, const char *data, size_t len) {
     struct Custom_atlas *atlas = malloc(sizeof(struct Custom_atlas));
     if (!atlas)
         ww_panic("Failed to allocate atlas");
 
-    atlas->width = width;
+    if (len == 0) {
+        atlas->width = width;
+        unsigned char *atlasData = (unsigned char *)calloc(width * width * 4, 1);
 
-    unsigned char *atlasData = (unsigned char *)calloc(width * width * 4, 1);
+        server_gl_with(scene->gl, false) {
+            glGenTextures(1, &atlas->tex);
+            glBindTexture(GL_TEXTURE_2D, atlas->tex);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, width, 0, GL_RGBA, GL_UNSIGNED_BYTE,
+                         atlasData);
+            glBindTexture(GL_TEXTURE_2D, 0);
+            free(atlasData);
+        }
+    } else {
+        if (len < 8) {
+            ww_log(LOG_ERROR, "raw dump data too small");
+            free(atlas);
+            return NULL;
+        }
 
-    server_gl_with(scene->gl, false) {
-        glGenTextures(1, &atlas->tex);
-        glBindTexture(GL_TEXTURE_2D, atlas->tex);
+        // dimensions from dump header
+        int dump_width = *(int *)data;
+        int dump_height = *(int *)(data + 4);
+        const char *pixel_data = data + 8;
+        size_t pixel_data_size = len - 8;
 
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        if (dump_width != dump_height) {
+            ww_log(LOG_ERROR, "atlas must be square (width=%d, height=%d)", dump_width,
+                   dump_height);
+            free(atlas);
+            return NULL;
+        }
+        if (pixel_data_size != (size_t)dump_width * dump_height * 4) {
+            ww_log(LOG_ERROR, "raw dump data size mismatch (expected=%zu, got=%zu)",
+                   (size_t)dump_width * dump_height * 4, pixel_data_size);
+            free(atlas);
+            return NULL;
+        }
 
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        atlas->width = dump_width;
 
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, width, 0, GL_RGBA, GL_UNSIGNED_BYTE,
-                     atlasData);
-
-        glBindTexture(GL_TEXTURE_2D, 0);
-        free(atlasData);
+        server_gl_with(scene->gl, false) {
+            glGenTextures(1, &atlas->tex);
+            glBindTexture(GL_TEXTURE_2D, atlas->tex);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, atlas->width, atlas->width, 0, GL_RGBA,
+                         GL_UNSIGNED_BYTE, pixel_data);
+            glBindTexture(GL_TEXTURE_2D, 0);
+        }
     }
 
     return atlas;
 }
-
 void
 scene_atlas_raw_image(struct scene *scene, struct Custom_atlas *atlas, const char *data,
                       size_t data_len, u_int32_t x, uint32_t y) {
@@ -1329,6 +1363,47 @@ scene_atlas_raw_image(struct scene *scene, struct Custom_atlas *atlas, const cha
 
         free(png.data);
     }
+}
+
+char *
+atlas_get_dump(struct scene *scene, struct Custom_atlas *atlas, size_t *out_len) {
+    if (!atlas || !out_len) {
+        ww_log(LOG_ERROR, "atlas or out_len is NULL");
+        if (out_len)
+            *out_len = 0;
+        return NULL;
+    }
+
+    size_t pixel_data_size = atlas->width * atlas->width * 4;
+    *out_len = 8 + pixel_data_size;
+
+    char *dump_data = malloc(*out_len);
+    check_alloc(dump_data);
+
+    *(int *)dump_data = atlas->width;
+    *(int *)(dump_data + 4) = atlas->width;
+
+    char *pixel_data = dump_data + 8;
+    server_gl_with(scene->gl, false) {
+        // create framebuffer to read from texture
+        GLuint fbo;
+        glGenFramebuffers(1, &fbo);
+        glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, atlas->tex, 0);
+
+        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
+            // read pixels from framebuffer
+            glReadPixels(0, 0, atlas->width, atlas->width, GL_RGBA, GL_UNSIGNED_BYTE, pixel_data);
+        } else {
+            ww_log(LOG_ERROR, "framebuffer incomplete for atlas dump");
+        }
+
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glDeleteFramebuffers(1, &fbo);
+    }
+
+    return dump_data;
 }
 
 void

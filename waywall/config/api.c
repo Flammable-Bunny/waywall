@@ -25,6 +25,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -413,6 +414,24 @@ atlas_raw(lua_State *L) {
 }
 
 static int
+atlas_get_raw(lua_State *L) {
+
+    struct config_vm *vm = config_vm_from(L);
+    struct wrap *wrap = config_vm_get_wrap(vm);
+    struct Custom_atlas **atlas = lua_touserdata(L, 1);
+
+    size_t data_size;
+    char *data = atlas_get_dump(wrap->scene, *atlas, &data_size);
+    ww_log(LOG_INFO, "Dump len: %zu", data_size);
+
+    lua_pushlstring(L, data, data_size);
+
+    free(data);
+
+    return 1;
+}
+
+static int
 atlas_index(lua_State *L) {
     const char *key = luaL_checkstring(L, 2);
 
@@ -420,6 +439,8 @@ atlas_index(lua_State *L) {
         lua_pushcfunction(L, atlas_close_);
     } else if (strcmp(key, "insert_raw") == 0) {
         lua_pushcfunction(L, atlas_raw);
+    } else if (strcmp(key, "get_dump") == 0) {
+        lua_pushcfunction(L, atlas_get_raw);
     } else {
         lua_pushnil(L);
     }
@@ -1489,6 +1510,7 @@ l_http_client(lua_State *L) {
 static int
 l_atlas(lua_State *L) {
     static const int ARG_WIDTH = 1;
+    static const int ARG_DATA = 2;
 
     // Prologue
     struct config_vm *vm = config_vm_from(L);
@@ -1499,21 +1521,27 @@ l_atlas(lua_State *L) {
 
     const int width = luaL_checkinteger(L, ARG_WIDTH);
 
+    const char *data = NULL;
+    size_t len = 0;
+
+    if (lua_gettop(L) >= ARG_DATA && !lua_isnil(L, ARG_DATA)) {
+        data = luaL_checklstring(L, ARG_DATA, &len);
+    }
+
     // Body
     struct Custom_atlas **atlas = lua_newuserdata(L, sizeof(*atlas));
     check_alloc(atlas);
-
     luaL_getmetatable(L, METATABLE_ATLAS);
     lua_setmetatable(L, -2);
 
-    *atlas = scene_create_atlas(wrap->scene, width);
+    *atlas = scene_create_atlas(wrap->scene, width, data, len);
     if (!*atlas) {
         return luaL_error(L, "failed to init atlas");
     }
+
     // Epilogue. The userdata atlas was already pushed to the stack by the above code.
     return 1;
 }
-
 static const struct luaL_Reg lua_lib[] = {
     // public (see api.lua)
     {"active_res", l_active_res},

@@ -165,6 +165,7 @@ M.http_client_create = priv.http_client_create
 
 --- Creates a atlas which can be used to store images
 -- @param width The width (in pixels) of the atlas
+-- @param data The data to use when first createing the atlas (optional)
 M.atlas = priv.atlas
 
 --- Creates a image from a location on a atlas

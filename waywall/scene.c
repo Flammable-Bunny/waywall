@@ -439,6 +439,41 @@ text_build(GLuint vbo, struct scene *scene, const char *data, const size_t data_
                 }
             }
         }
+
+        if (i + 1 < cps_len && cps[i] == '<' && cps[i + 1] == '+') {
+            size_t j = i + 2;
+            char buf[64];
+            size_t k = 0;
+
+            // copy digits until '>' or buffer full
+            while (j < cps_len && cps[j] != '>' && k < sizeof(buf) - 1) {
+                if (cps[j] < '0' || cps[j] > '9')
+                    break;
+                buf[k++] = (char)cps[j];
+                j++;
+            }
+            buf[k] = '\0';
+
+            if (cps[j] == '>') {
+                int adv = atoi(buf);
+
+                if (next_index >= capacity) {
+                    capacity *= 2;
+                    struct text_char *tmp = realloc(text_chars, capacity * sizeof *text_chars);
+                    if (!tmp)
+                        ww_panic("Out of memory");
+                    text_chars = tmp;
+                }
+
+                text_chars[next_index].c = 0;
+                text_chars[next_index].advance = adv;
+                memcpy(text_chars[next_index++].rgba, current_color, sizeof(float) * 4);
+
+                i = j;
+                continue;
+            }
+        }
+
         if (next_index >= capacity) {
             capacity *= 2;
             struct text_char *tmp = realloc(text_chars, capacity * sizeof(struct text_char));
@@ -448,6 +483,7 @@ text_build(GLuint vbo, struct scene *scene, const char *data, const size_t data_
             text_chars = tmp;
         }
         text_chars[next_index].c = cps[i];
+        text_chars[next_index].advance = 0;
         memcpy(text_chars[next_index++].rgba, current_color, sizeof(float) * 4);
     }
 
@@ -476,6 +512,11 @@ text_build(GLuint vbo, struct scene *scene, const char *data, const size_t data_
         if (g.character == '\n') {
             y += options->size + options->line_spacing;
             x = options->x;
+            continue;
+        }
+
+        if (text_chars[i].advance != 0) {
+            x += text_chars[i].advance;
             continue;
         }
 
@@ -537,11 +578,15 @@ text_get_advance(struct scene *scene, const char *data, const size_t data_len,
     // remove color tags
     next_index = 0;
     capacity = 16;
-    u_int32_t *text_chars = zalloc(16, sizeof(u_int32_t));
+    struct text_char {
+        uint32_t c;
+        int advance;
+    };
+    struct text_char *text_chars = zalloc(16, sizeof(struct text_char));
+    int pending_advance = 0;
 
     for (size_t i = 0; i < cps_len; i++) {
         if (i + 1 < cps_len && cps[i] == '<' && cps[i + 1] == '#') {
-            // <#FFFFFFFF>
             if (cps_len - i >= 11) {
                 float dummy_color[4];
                 if (parse_color(cps + i + 2, dummy_color) == 0 && cps[i + 10] == '>') {
@@ -550,15 +595,37 @@ text_get_advance(struct scene *scene, const char *data, const size_t data_len,
                 }
             }
         }
+
+        if (i + 1 < cps_len && cps[i] == '<' && cps[i + 1] == '+') {
+            size_t j = i + 2;
+            char buf[64];
+            size_t k = 0;
+            while (j < cps_len && cps[j] != '>' && k < sizeof(buf) - 1) {
+                if (cps[j] < '0' || cps[j] > '9')
+                    break;
+                buf[k++] = (char)cps[j];
+                j++;
+            }
+            buf[k] = '\0';
+            if (cps[j] == '>') {
+                pending_advance = atoi(buf);
+                i = j;
+                continue;
+            }
+        }
+
         if (next_index >= capacity) {
             capacity *= 2;
-            u_int32_t *tmp = realloc(text_chars, capacity * sizeof(u_int32_t));
-            if (tmp == NULL) {
+            struct text_char *tmp = realloc(text_chars, capacity * sizeof(*text_chars));
+            if (!tmp)
                 ww_panic("Out of memory");
-            }
             text_chars = tmp;
         }
-        text_chars[next_index++] = cps[i];
+
+        text_chars[next_index].c = cps[i];
+        text_chars[next_index].advance = pending_advance;
+        next_index++;
+        pending_advance = 0;
     }
 
     free(cps);
@@ -569,7 +636,7 @@ text_get_advance(struct scene *scene, const char *data, const size_t data_len,
     int32_t y = 0;
 
     for (size_t i = 0; i < character_count; i++) {
-        const uint32_t ch = text_chars[i];
+        const uint32_t ch = text_chars[i].c;
 
         if (ch == '\n') {
             x = 0;
@@ -577,8 +644,9 @@ text_get_advance(struct scene *scene, const char *data, const size_t data_len,
             continue;
         }
 
-        struct glyph_metadata glyph = get_glyph(scene, ch, size);
+        x += text_chars[i].advance;
 
+        struct glyph_metadata glyph = get_glyph(scene, ch, size);
         x += (int)(glyph.advance >> 6);
     }
 

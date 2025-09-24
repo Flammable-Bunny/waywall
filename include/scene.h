@@ -22,6 +22,7 @@
 struct text_char {
     uint32_t c;    // utf8 codepoint
     float rgba[4]; // color
+    int advance;   // only used for custom advance, will be ignored if 0
 };
 
 // single glyph's data

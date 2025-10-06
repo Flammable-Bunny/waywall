@@ -35,9 +35,16 @@ struct glyph_metadata {
     int atlas_x, atlas_y;
 
     uint32_t character;
+};
 
-    bool needs_gpu_upload;
+struct pending_glyph {
+    uint32_t character;
+    int width, height;
+    int bearingX, bearingY;
+    FT_Pos advance;
+    int atlas_x, atlas_y;
     unsigned char *bitmap_data;
+    struct pending_glyph *next;
 };
 
 // all glyphs for a given font size in a dynamic atlas
@@ -49,12 +56,16 @@ struct font_size_obj {
     size_t glyphs_capacity;  // allocated size of chars array
 
     // atlas
+    bool atlas_initialized;
     GLuint atlas_tex;
     int atlas_width;
     int atlas_height;
     int atlas_x;
     int atlas_y;
     int atlas_row_height;
+
+    struct pending_glyph *pending_head;
+    struct pending_glyph *pending_tail;
 };
 
 struct Custom_atlas {
@@ -150,12 +161,10 @@ struct scene_text_options {
     int32_t y;
 
     int32_t size;
-    int32_t atlas_index;
+    int32_t line_spacing;
 
     int32_t depth;
     char *shader_name;
-
-    int32_t line_spacing;
 };
 
 struct scene_object;

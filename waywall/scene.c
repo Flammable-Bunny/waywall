@@ -78,10 +78,9 @@ struct scene_text {
 
     size_t shader_index;
 
-    GLuint vbo, tex;
+    GLuint vbo;
     size_t vtxcount;
 
-    int32_t x, y;
     uint32_t font_size;
 };
 
@@ -263,16 +262,9 @@ get_glyph(struct scene *scene, const uint32_t c, const size_t font_height) {
         font_size_obj->glyphs =
             calloc(font_size_obj->glyphs_capacity, sizeof(struct glyph_metadata));
         font_size_obj->next_glyph_index = 0;
-
-        glGenTextures(1, &font_size_obj->atlas_tex);
-        gl_using_texture(GL_TEXTURE_2D, font_size_obj->atlas_tex) {
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_ALPHA, font_size_obj->atlas_width,
-                         font_size_obj->atlas_height, 0, GL_ALPHA, GL_UNSIGNED_BYTE, NULL);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        }
+        font_size_obj->atlas_initialized = false; // Mark as not initialized
+        font_size_obj->pending_head = NULL;
+        font_size_obj->pending_tail = NULL;
 
         scene->font.fonts_len = new_len;
     }
@@ -316,10 +308,35 @@ get_glyph(struct scene *scene, const uint32_t c, const size_t font_height) {
     data.atlas_x = font_size_obj->atlas_x;
     data.atlas_y = font_size_obj->atlas_y;
 
-    data.needs_gpu_upload = true;
-    data.bitmap_data = malloc(data.width * data.height);
-    if (data.bitmap_data && buffer) {
-        memcpy(data.bitmap_data, buffer, data.width * data.height);
+    // create pending glyph
+    struct pending_glyph *pending = malloc(sizeof(struct pending_glyph));
+    if (!pending)
+        ww_panic("Out of memory");
+
+    pending->character = c;
+    pending->width = data.width;
+    pending->height = data.height;
+    pending->bearingX = data.bearingX;
+    pending->bearingY = data.bearingY;
+    pending->advance = data.advance;
+    pending->atlas_x = data.atlas_x;
+    pending->atlas_y = data.atlas_y;
+    pending->bitmap_data = NULL;
+    pending->next = NULL;
+
+    if (buffer && data.width > 0 && data.height > 0) {
+        pending->bitmap_data = malloc(data.width * data.height);
+        if (pending->bitmap_data) {
+            memcpy(pending->bitmap_data, buffer, data.width * data.height);
+        }
+    }
+
+    // add to queue
+    if (font_size_obj->pending_tail) {
+        font_size_obj->pending_tail->next = pending;
+        font_size_obj->pending_tail = pending;
+    } else {
+        font_size_obj->pending_head = font_size_obj->pending_tail = pending;
     }
 
     // update atlas placement
@@ -336,6 +353,7 @@ get_glyph(struct scene *scene, const uint32_t c, const size_t font_height) {
             ww_panic("Out of memory");
         font_size_obj->glyphs = tmp;
     }
+
     font_size_obj->glyphs[font_size_obj->next_glyph_index++] = data;
 
     return data;
@@ -669,34 +687,46 @@ text_release(struct scene_object *object) {
 }
 
 static void
-upload_pending_glyphs(struct scene *scene, struct font_size_obj *font_obj) {
-    bool has_pending = false;
+process_pending_font_operations(struct scene *scene, struct font_size_obj *font_obj) {
+    // initialize atlas texture if needed
+    if (!font_obj->atlas_initialized) {
+        glGenTextures(1, &font_obj->atlas_tex);
+        gl_using_texture(GL_TEXTURE_2D, font_obj->atlas_tex) {
+            unsigned char *empty_data =
+                calloc(font_obj->atlas_width * font_obj->atlas_height * 4, 1);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_ALPHA, font_obj->atlas_width, font_obj->atlas_height,
+                         0, GL_ALPHA, GL_UNSIGNED_BYTE, empty_data);
+            free(empty_data);
 
-    for (size_t i = 0; i < font_obj->next_glyph_index; i++) {
-        if (font_obj->glyphs[i].needs_gpu_upload) {
-            has_pending = true;
-            break;
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         }
+        font_obj->atlas_initialized = true;
     }
 
-    if (!has_pending)
-        return;
+    // upload pending glyphs
+    if (font_obj->pending_head) {
+        gl_using_texture(GL_TEXTURE_2D, font_obj->atlas_tex) {
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
 
-    gl_using_texture(GL_TEXTURE_2D, font_obj->atlas_tex) {
-        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+            struct pending_glyph *current = font_obj->pending_head;
+            while (current) {
 
-        for (size_t i = 0; i < font_obj->next_glyph_index; i++) {
-            struct glyph_metadata *glyph = &font_obj->glyphs[i];
+                if (current->bitmap_data && current->width > 0 && current->height > 0)
+                    glTexSubImage2D(GL_TEXTURE_2D, 0, current->atlas_x, current->atlas_y,
+                                    current->width, current->height, GL_ALPHA, GL_UNSIGNED_BYTE,
+                                    current->bitmap_data);
 
-            if (glyph->needs_gpu_upload && glyph->bitmap_data) {
-                glTexSubImage2D(GL_TEXTURE_2D, 0, glyph->atlas_x, glyph->atlas_y, glyph->width,
-                                glyph->height, GL_ALPHA, GL_UNSIGNED_BYTE, glyph->bitmap_data);
-
-                // Clean up
-                free(glyph->bitmap_data);
-                glyph->bitmap_data = NULL;
-                glyph->needs_gpu_upload = false;
+                // free bitmap data and move to next pending glyph
+                free(current->bitmap_data);
+                struct pending_glyph *next = current->next;
+                free(current);
+                current = next;
             }
+
+            font_obj->pending_head = font_obj->pending_tail = NULL;
         }
     }
 }
@@ -707,7 +737,6 @@ text_render(struct scene_object *object) {
     struct scene_text *text = scene_text_from_object(object);
     struct scene *scene = text->parent;
 
-    // find font obj
     struct font_size_obj *font_obj = NULL;
     for (size_t i = 0; i < scene->font.fonts_len; i++) {
         if (scene->font.fonts[i].font_height == text->font_size) {
@@ -719,7 +748,7 @@ text_render(struct scene_object *object) {
     if (!font_obj)
         return;
 
-    upload_pending_glyphs(scene, font_obj);
+    process_pending_font_operations(scene, font_obj);
 
     server_gl_shader_use(scene->shaders.data[text->shader_index].shader);
     glUniform2f(scene->shaders.data[text->shader_index].shader_u_dst_size, scene->ui->width,
@@ -733,6 +762,7 @@ text_render(struct scene_object *object) {
         }
     }
 }
+
 static void
 on_gl_frame(struct wl_listener *listener, void *data) {
     struct scene *scene = wl_container_of(listener, scene, on_gl_frame);
@@ -1211,26 +1241,36 @@ scene_destroy(struct scene *scene) {
         }
 
         glDeleteBuffers(2, (GLuint[]){scene->buffers.debug, scene->buffers.stencil_rect});
-    }
-    free(scene->shaders.data);
 
+        // clean up font resources
+        for (size_t i = 0; i < scene->font.fonts_len; i++) {
+            struct font_size_obj *font_obj = &scene->font.fonts[i];
+
+            // delete atlas texture if created
+            if (font_obj->atlas_initialized) {
+                glDeleteTextures(1, &font_obj->atlas_tex);
+            }
+
+            // clean up pending glyphs
+            struct pending_glyph *current = font_obj->pending_head;
+            while (current) {
+                free(current->bitmap_data);
+                struct pending_glyph *next = current->next;
+                free(current);
+                current = next;
+            }
+
+            free(font_obj->glyphs);
+        }
+    }
+
+    free(scene->shaders.data);
     wl_list_remove(&scene->on_gl_frame.link);
 
     FT_Done_Face(scene->font.face);
     FT_Done_FreeType(scene->font.ft);
 
-    for (size_t i = 0; i < scene->font.fonts_len; i++) {
-        struct font_size_obj *font_obj = &scene->font.fonts[i];
-        for (size_t j = 0; j < font_obj->next_glyph_index; j++) {
-            if (font_obj->glyphs[j].bitmap_data) {
-                free(font_obj->glyphs[j].bitmap_data);
-                font_obj->glyphs[j].bitmap_data = NULL;
-            }
-        }
-        free(font_obj->glyphs);
-    }
     free(scene->font.fonts);
-
     free(scene);
 }
 
@@ -1312,8 +1352,6 @@ scene_add_text(struct scene *scene, const char *data, const struct scene_text_op
     struct scene_text *text = zalloc(1, sizeof(*text));
 
     text->parent = scene;
-    text->x = options->x;
-    text->y = options->y;
     text->font_size = options->size;
 
     if (options->shader_name == NULL) {

@@ -41,7 +41,7 @@ write_callback(void *contents, size_t size, size_t nmemb, struct response_buffer
 
 static bool
 response_queue_is_full(struct response_queue *q) {
-    return ((q->write_pos + 1) % MAX_QUEUED_RESPONSES) == q->read_pos;
+    return ((q->write_pos + 1) % MAX_QUEUED) == q->read_pos;
 }
 
 static bool
@@ -51,7 +51,7 @@ response_queue_is_empty(struct response_queue *q) {
 
 static bool
 request_queue_is_full(struct Http_client *client) {
-    return ((client->request_write_pos + 1) % MAX_QUEUED_RESPONSES) == client->request_read_pos;
+    return ((client->request_write_pos + 1) % MAX_QUEUED) == client->request_read_pos;
 }
 
 static bool
@@ -63,7 +63,7 @@ static void
 response_queue_init(struct response_queue *q) {
     if (!q)
         return;
-    for (int i = 0; i < MAX_QUEUED_RESPONSES; i++) {
+    for (int i = 0; i < MAX_QUEUED; i++) {
         free(q->responses[i]);
         q->responses[i] = NULL;
     }
@@ -75,7 +75,7 @@ static void
 request_queue_init(struct Http_client *client) {
     if (!client)
         return;
-    for (int i = 0; i < MAX_QUEUED_RESPONSES; i++) {
+    for (int i = 0; i < MAX_QUEUED; i++) {
         free(client->pending_requests[i]);
         client->pending_requests[i] = NULL;
     }
@@ -116,7 +116,7 @@ response_queue_push(struct Http_client *client, const char *response, size_t res
     qr->url = strdup(url);
 
     q->responses[q->write_pos] = qr;
-    q->write_pos = (q->write_pos + 1) % MAX_QUEUED_RESPONSES;
+    q->write_pos = (q->write_pos + 1) % MAX_QUEUED;
 
     pushed_count++;
 
@@ -124,7 +124,7 @@ response_queue_push(struct Http_client *client, const char *response, size_t res
 }
 
 static void
-request_queue_push(struct Http_client *client, const char *url) {
+request_queue_push(struct Http_client *client, char *url, char **headers) {
     pthread_mutex_lock(&client->request_mutex);
 
     if (request_queue_is_full(client)) {
@@ -133,22 +133,23 @@ request_queue_push(struct Http_client *client, const char *url) {
         return;
     }
 
-    char *copy = strdup(url);
-    if (!copy) {
-        ww_log(LOG_ERROR, "strdup failed");
+    client->pending_requests[client->request_write_pos] = malloc(sizeof(struct pending_request));
+    if (!client->pending_requests[client->request_write_pos]) {
+        ww_log(LOG_ERROR, "malloc failed for pending_request");
         pthread_mutex_unlock(&client->request_mutex);
         return;
     }
 
-    client->pending_requests[client->request_write_pos] = copy;
-    client->request_write_pos = (client->request_write_pos + 1) % MAX_QUEUED_RESPONSES;
+    client->pending_requests[client->request_write_pos]->url = url;
+    client->pending_requests[client->request_write_pos]->headers = headers;
+    client->request_write_pos = (client->request_write_pos + 1) % MAX_QUEUED;
 
     // Signal the worker thread that a new request is available
     pthread_cond_signal(&client->request_cond);
     pthread_mutex_unlock(&client->request_mutex);
 }
 
-static char *
+static struct pending_request *
 request_queue_pop(struct Http_client *client) {
     pthread_mutex_lock(&client->request_mutex);
 
@@ -161,19 +162,19 @@ request_queue_pop(struct Http_client *client) {
         return NULL;
     }
 
-    char *url = client->pending_requests[client->request_read_pos];
+    struct pending_request *ret = client->pending_requests[client->request_read_pos];
     client->pending_requests[client->request_read_pos] = NULL;
-    client->request_read_pos = (client->request_read_pos + 1) % MAX_QUEUED_RESPONSES;
+    client->request_read_pos = (client->request_read_pos + 1) % MAX_QUEUED;
 
     pthread_mutex_unlock(&client->request_mutex);
-    return url;
+    return ret;
 }
 
 static void
 response_queue_cleanup(struct response_queue *q) {
     if (!q)
         return;
-    for (int i = 0; i < MAX_QUEUED_RESPONSES; i++) {
+    for (int i = 0; i < MAX_QUEUED; i++) {
         if (q->responses[i]) {
             free(q->responses[i]->data);
             free(q->responses[i]->url);
@@ -189,7 +190,7 @@ static void
 request_queue_cleanup(struct Http_client *client) {
     if (!client)
         return;
-    for (int i = 0; i < MAX_QUEUED_RESPONSES; i++) {
+    for (int i = 0; i < MAX_QUEUED; i++) {
         free(client->pending_requests[i]);
         client->pending_requests[i] = NULL;
     }
@@ -206,14 +207,27 @@ http_thread(void *arg) {
     }
 
     while (!client->should_exit) {
-        char *url = request_queue_pop(client);
-        if (!url)
+
+        struct pending_request *req = request_queue_pop(client);
+
+        if (!req)
             break;
 
         struct response_buffer response = {0};
 
+        struct curl_slist *headers = NULL;
+
+        if (req->headers) {
+            for (int i = 0; req->headers[i]; i++) {
+                headers = curl_slist_append(headers, req->headers[i]);
+            }
+
+            if (headers)
+                curl_easy_setopt(client->curl, CURLOPT_HTTPHEADER, headers);
+        }
+
         // configure curl
-        curl_easy_setopt(client->curl, CURLOPT_URL, url);
+        curl_easy_setopt(client->curl, CURLOPT_URL, req->url);
         curl_easy_setopt(client->curl, CURLOPT_WRITEFUNCTION, write_callback);
         curl_easy_setopt(client->curl, CURLOPT_WRITEDATA, &response);
         curl_easy_setopt(client->curl, CURLOPT_FOLLOWLOCATION, 1L);
@@ -224,20 +238,27 @@ http_thread(void *arg) {
 
         if (res != CURLE_OK) {
             const char *error_msg = curl_easy_strerror(res);
-            response_queue_push(client, error_msg, strlen(error_msg), url);
+            response_queue_push(client, error_msg, strlen(error_msg), req->url);
             ww_log(LOG_WARN, "HTTP request failed: %s", error_msg);
         } else if (response.data && response.size > 0) {
-            response_queue_push(client, response.data, response.size, url);
+            response_queue_push(client, response.data, response.size, req->url);
         } else {
             const char *empty = "";
-            response_queue_push(client, empty, 0, url);
+            response_queue_push(client, empty, 0, req->url);
         }
 
         if (response.data) {
             free(response.data);
             response.data = NULL;
         }
-        free(url);
+        if (req->headers) {
+            for (int i = 0; req->headers[i]; i++) {
+                free(req->headers[i]);
+            }
+            free(req->headers);
+            curl_slist_free_all(headers);
+        }
+        free(req->url);
     }
 
     return NULL;
@@ -328,7 +349,7 @@ http_client_create(int callback, lua_State *L) {
 }
 
 void
-http_client_get(struct Http_client *client, const char *url) {
+http_client_get(struct Http_client *client, char *url, char **headers) {
     if (!client || !client->curl || !url) {
         ww_log(LOG_WARN, "Invalid parameters for HTTP GET");
         return;
@@ -339,11 +360,12 @@ http_client_get(struct Http_client *client, const char *url) {
         return;
     }
 
-    request_queue_push(client, url);
+    request_queue_push(client, url, headers);
 }
 
 void
 http_client_destroy(struct Http_client *client) {
+    ww_log(LOG_INFO, "destroying client");
     if (!client)
         return;
 
@@ -404,7 +426,7 @@ manage_new_responses() {
         while (!response_queue_is_empty(q)) {
             struct queued_response *qr = q->responses[q->read_pos];
             q->responses[q->read_pos] = NULL;
-            q->read_pos = (q->read_pos + 1) % MAX_QUEUED_RESPONSES; // Move read position
+            q->read_pos = (q->read_pos + 1) % MAX_QUEUED;
 
             lua_rawgeti(client->vm->L, LUA_REGISTRYINDEX, client->callback);
             lua_pushlstring(client->vm->L, qr->data, qr->size);

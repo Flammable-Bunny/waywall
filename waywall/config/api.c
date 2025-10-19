@@ -9,7 +9,6 @@
 #include "irc.h"
 #include "scene.h"
 #include "server/server.h"
-#include "server/ui.h"
 #include "server/wl_seat.h"
 #include "server/wp_relative_pointer.h"
 #include "timer.h"
@@ -349,7 +348,33 @@ http_client_get_(lua_State *L) {
 
     const char *message = luaL_checkstring(L, 2);
 
-    http_client_get(*client, message);
+    char *copy = strdup(message);
+
+    char **string_array = NULL;
+    int i = 0;
+
+    while (lua_isstring(L, 3 + i)) {
+        const char *s = lua_tostring(L, 3 + i);
+        char **tmp = realloc(string_array, sizeof(char *) * (i + 2));
+        if (!tmp) {
+            for (int j = 0; j < i; j++)
+                free(string_array[j]);
+            free(string_array);
+            return luaL_error(L, "Out of memory");
+        }
+        string_array = tmp;
+        string_array[i] = strdup(s);
+        if (!string_array[i])
+            return luaL_error(L, "strdup failed");
+        i++;
+    }
+
+    if (string_array)
+        string_array[i] = NULL;
+
+    http_client_get(*client, copy, string_array);
+
+    // http request takes ownership of the string_array
 
     return 0;
 }

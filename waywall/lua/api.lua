@@ -172,6 +172,12 @@ M.atlas = priv.atlas
 -- @param options The options table for the image
 M.image_a = priv.image_a
 
+--- Creates an animated image from an AVIF file
+-- @param path The filepath to the AVIF image
+-- @param options The options to create the animated image with
+-- @return image The animated image object
+M.animated_image = priv.animated_image
+
 --- Finds the x and y advance length for a string when using a givin font size.
 -- @param text The text to find the advance of
 -- @param size The font size to use

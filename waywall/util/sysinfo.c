@@ -1,9 +1,11 @@
 #include "util/sysinfo.h"
 #include "util/log.h"
 #include "util/prelude.h"
+#include <GLES2/gl2.h>
 #include <fcntl.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/resource.h>
 #include <sys/utsname.h>
 #include <unistd.h>
@@ -94,4 +96,138 @@ sysinfo_dump_log() {
     log_wl_version();
 
     ww_log(LOG_INFO, "---- END SYSTEM INFO");
+}
+
+// NVIDIA-specific VRAM query extension
+#ifndef GL_NVX_gpu_memory_info
+#define GL_GPU_MEMORY_INFO_DEDICATED_VIDMEM_NVX 0x9047
+#define GL_GPU_MEMORY_INFO_TOTAL_AVAILABLE_MEMORY_NVX 0x9048
+#define GL_GPU_MEMORY_INFO_CURRENT_AVAILABLE_VIDMEM_NVX 0x9049
+#define GL_GPU_MEMORY_INFO_EVICTION_COUNT_NVX 0x904A
+#define GL_GPU_MEMORY_INFO_EVICTED_MEMORY_NVX 0x904B
+#endif
+
+// AMD-specific VRAM query extension
+#ifndef GL_ATI_meminfo
+#define GL_VBO_FREE_MEMORY_ATI 0x87FB
+#define GL_TEXTURE_FREE_MEMORY_ATI 0x87FC
+#define GL_RENDERBUFFER_FREE_MEMORY_ATI 0x87FD
+#endif
+
+size_t
+sysinfo_query_vram_total() {
+    const char *vendor = (const char *)glGetString(GL_VENDOR);
+    const char *renderer = (const char *)glGetString(GL_RENDERER);
+
+    if (!vendor) {
+        ww_log(LOG_WARN, "unable to query GL_VENDOR for VRAM detection");
+        return 0;
+    }
+
+    ww_log(LOG_INFO, "GPU vendor: %s, renderer: %s", vendor, renderer ? renderer : "unknown");
+
+    // Clear any previous GL errors before querying
+    while (glGetError() != GL_NO_ERROR)
+        ;
+
+    // Try NVIDIA extension (proprietary and nouveau drivers)
+    if (strstr(vendor, "NVIDIA") || (renderer && strstr(renderer, "NVIDIA"))) {
+        GLint total_kb = 0;
+
+        // Try dedicated VRAM query first
+        glGetIntegerv(GL_GPU_MEMORY_INFO_DEDICATED_VIDMEM_NVX, &total_kb);
+        GLenum err = glGetError();
+
+        if (err == GL_NO_ERROR && total_kb > 0) {
+            ww_log(LOG_INFO, "NVIDIA GPU: %d MB VRAM (dedicated)", total_kb / 1024);
+            return (size_t)total_kb * 1024; // Convert KB to bytes
+        }
+
+        // Try total available memory as fallback
+        glGetIntegerv(GL_GPU_MEMORY_INFO_TOTAL_AVAILABLE_MEMORY_NVX, &total_kb);
+        err = glGetError();
+
+        if (err == GL_NO_ERROR && total_kb > 0) {
+            ww_log(LOG_INFO, "NVIDIA GPU: %d MB VRAM (total available)", total_kb / 1024);
+            return (size_t)total_kb * 1024; // Convert KB to bytes
+        }
+
+        // Nouveau driver fallback: may not support extensions
+        ww_log(LOG_WARN,
+               "NVIDIA GPU detected but unable to query VRAM (nouveau driver or missing extension)");
+    }
+
+    // Try AMD extension
+    if (strstr(vendor, "AMD") || strstr(vendor, "ATI") || strstr(vendor, "Advanced Micro Devices")) {
+        GLint mem_info[4] = {0};
+        glGetIntegerv(GL_TEXTURE_FREE_MEMORY_ATI, mem_info);
+        GLenum err = glGetError();
+
+        if (err == GL_NO_ERROR && mem_info[0] > 0) {
+            // mem_info[0] contains free memory in KB
+            // For AMD, we report free as "total" since that's what we can query
+            ww_log(LOG_INFO, "AMD GPU: ~%d MB VRAM (currently free)", mem_info[0] / 1024);
+            return (size_t)mem_info[0] * 1024; // Convert KB to bytes
+        }
+
+        ww_log(LOG_WARN, "AMD GPU detected but unable to query VRAM (missing extension)");
+    }
+
+    // Try Intel integrated graphics fallback
+    if (strstr(vendor, "Intel")) {
+        // Intel iGPUs share system RAM, so we can't accurately query dedicated VRAM
+        // Use a conservative estimate based on common configurations
+        ww_log(LOG_WARN,
+               "Intel integrated GPU detected, using conservative 2GB VRAM estimate (shared memory)");
+        return (size_t)2 * 1024 * 1024 * 1024; // 2GB
+    }
+
+    ww_log(LOG_WARN, "unable to query VRAM for vendor: %s", vendor);
+    return 0;
+}
+
+size_t
+sysinfo_query_vram_available() {
+    const char *vendor = (const char *)glGetString(GL_VENDOR);
+    const char *renderer = (const char *)glGetString(GL_RENDERER);
+
+    if (!vendor) {
+        return 0;
+    }
+
+    // Clear any previous GL errors
+    while (glGetError() != GL_NO_ERROR)
+        ;
+
+    // Try NVIDIA extension
+    if (strstr(vendor, "NVIDIA") || (renderer && strstr(renderer, "NVIDIA"))) {
+        GLint available_kb = 0;
+        glGetIntegerv(GL_GPU_MEMORY_INFO_CURRENT_AVAILABLE_VIDMEM_NVX, &available_kb);
+        GLenum err = glGetError();
+
+        if (err == GL_NO_ERROR && available_kb > 0) {
+            return (size_t)available_kb * 1024; // Convert KB to bytes
+        }
+
+        // Nouveau fallback: if extension unavailable, return 0 (will use total instead)
+        return 0;
+    }
+
+    // Try AMD extension
+    if (strstr(vendor, "AMD") || strstr(vendor, "ATI") || strstr(vendor, "Advanced Micro Devices")) {
+        GLint mem_info[4] = {0};
+        glGetIntegerv(GL_TEXTURE_FREE_MEMORY_ATI, mem_info);
+        GLenum err = glGetError();
+
+        if (err == GL_NO_ERROR && mem_info[0] > 0) {
+            return (size_t)mem_info[0] * 1024; // Convert KB to bytes
+        }
+    }
+
+    // Intel iGPUs: can't query available VRAM reliably
+    if (strstr(vendor, "Intel")) {
+        return 0;
+    }
+
+    return 0;
 }

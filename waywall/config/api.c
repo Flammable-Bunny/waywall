@@ -790,6 +790,58 @@ l_image_from_atlas(lua_State *L) {
 }
 
 static int
+l_animated_image(lua_State *L) {
+    static const int ARG_PATH = 1;
+    static const int ARG_OPTIONS = 2;
+
+    // Prologue
+    struct config_vm *vm = config_vm_from(L);
+    struct wrap *wrap = config_vm_get_wrap(vm);
+    if (!wrap) {
+        return luaL_error(L, STARTUP_ERRMSG("animated_image"));
+    }
+
+    const char *path = luaL_checkstring(L, ARG_PATH);
+    luaL_checktype(L, ARG_OPTIONS, LUA_TTABLE);
+    lua_settop(L, ARG_OPTIONS);
+
+    struct scene_animated_image_options options = {0};
+    unmarshal_box_key(L, "dst", &options.dst);
+
+    lua_pushstring(L, "shader");
+    lua_rawget(L, ARG_OPTIONS);
+    if (lua_type(L, -1) == LUA_TSTRING) {
+        options.shader_name = strdup(lua_tostring(L, -1));
+    }
+    lua_pop(L, 1);
+
+    lua_pushstring(L, "depth");
+    lua_rawget(L, ARG_OPTIONS);
+    if (lua_type(L, -1) == LUA_TNUMBER) {
+        options.depth = lua_tointeger(L, -1);
+    } else {
+        options.depth = DEFAULT_DEPTH;
+    }
+    lua_pop(L, 1);
+
+    // Body
+    struct scene_image **image = lua_newuserdata(L, sizeof(*image));
+    check_alloc(image);
+
+    luaL_getmetatable(L, METATABLE_IMAGE);
+    lua_setmetatable(L, -2);
+
+    *image = scene_add_animated_image(wrap->scene, &options, path);
+    free(options.shader_name);
+    if (!*image) {
+        return luaL_error(L, "failed to create animated image from AVIF at '%s'", path);
+    }
+
+    // Epilogue. The userdata (image) was already pushed to the stack by the above code.
+    return 1;
+}
+
+static int
 l_mirror(lua_State *L) {
     static const int ARG_OPTIONS = 1;
 
@@ -1591,6 +1643,7 @@ static const struct luaL_Reg lua_lib[] = {
     {"http_client_create", l_http_client},
     {"atlas", l_atlas},
     {"image_a", l_image_from_atlas},
+    {"animated_image", l_animated_image},
     {"text_advance", l_text_advance},
 
     // private (see init.lua)

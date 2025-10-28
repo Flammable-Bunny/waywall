@@ -121,6 +121,8 @@ struct scene {
 
     struct Custom_atlas *atlas_arr;
     size_t atlas_arr_len;
+
+    struct animation_manager *anim_mgr;
 };
 
 struct scene_shader {
@@ -167,7 +169,16 @@ struct scene_text_options {
     char *shader_name;
 };
 
+struct scene_animated_image_options {
+    struct box dst;
+
+    int32_t depth;
+    char *shader_name;
+};
+
 struct scene_object;
+struct animation;
+struct animation_manager;
 
 struct scene *scene_create(struct config *cfg, struct server_gl *gl, struct server_ui *ui);
 void scene_destroy(struct scene *scene);
@@ -177,6 +188,9 @@ struct scene_image *scene_add_image(struct scene *scene, const struct scene_imag
 struct scene_image *
 scene_add_image_from_atlas(struct scene *scene,
                            const struct scene_image_from_atlas_options *options);
+struct scene_image *scene_add_animated_image(struct scene *scene,
+                                             const struct scene_animated_image_options *options,
+                                             const char *avif_path);
 struct scene_mirror *scene_add_mirror(struct scene *scene,
                                       const struct scene_mirror_options *options);
 struct scene_text *scene_add_text(struct scene *scene, const char *data,

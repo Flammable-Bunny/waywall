@@ -3,6 +3,7 @@
 #include "glsl/texcopy.vert.h"
 #include "glsl/text.frag.h"
 
+#include "animation.h"
 #include "scene.h"
 #include "server/gl.h"
 #include "server/ui.h"
@@ -59,6 +60,10 @@ struct scene_image {
     int32_t width, height;
 
     bool is_atlas_texture;
+    bool is_animated;
+
+    // For animated images
+    struct animation *animation;
 };
 
 struct scene_mirror {
@@ -143,10 +148,16 @@ image_release(struct scene_object *object) {
 
     if (image->parent) {
         server_gl_with(image->parent->gl, false) {
-            if (!image->is_atlas_texture) {
+            if (!image->is_atlas_texture && !image->is_animated) {
                 glDeleteTextures(1, &image->tex);
             }
             glDeleteBuffers(1, &image->vbo);
+        }
+
+        // Release animation if this is an animated image
+        if (image->is_animated && image->animation && image->parent->anim_mgr) {
+            animation_unref(image->parent->anim_mgr, image->animation);
+            image->animation = NULL;
         }
     }
 
@@ -159,6 +170,15 @@ image_render(struct scene_object *object) {
     struct scene_image *image = scene_image_from_object(object);
     struct scene *scene = image->parent;
 
+    // Get the texture to render (for animated images, get current frame)
+    GLuint texture = image->tex;
+    if (image->is_animated && image->animation && scene->anim_mgr) {
+        texture = animation_get_current_texture(scene->anim_mgr, image->animation);
+        if (texture == 0) {
+            return; // No frame available
+        }
+    }
+
     server_gl_shader_use(scene->shaders.data[image->shader_index].shader);
     glUniform2f(scene->shaders.data[image->shader_index].shader_u_dst_size, scene->ui->width,
                 scene->ui->height);
@@ -166,7 +186,7 @@ image_render(struct scene_object *object) {
                 image->height);
 
     gl_using_buffer(GL_ARRAY_BUFFER, image->vbo) {
-        gl_using_texture(GL_TEXTURE_2D, image->tex) {
+        gl_using_texture(GL_TEXTURE_2D, texture) {
             // Each image has 6 vertices in its vertex buffer.
             draw_vertex_list(&scene->shaders.data[image->shader_index], 6);
         }
@@ -687,47 +707,50 @@ text_release(struct scene_object *object) {
 }
 
 static void
-process_pending_font_operations(struct scene *scene, struct font_size_obj *font_obj) {
-    // initialize atlas texture if needed
+process_pending_font_operations(struct scene *scene, struct font_size_obj *font_obj)
+{
     if (!font_obj->atlas_initialized) {
         glGenTextures(1, &font_obj->atlas_tex);
-        gl_using_texture(GL_TEXTURE_2D, font_obj->atlas_tex) {
-            unsigned char *empty_data =
-                calloc(font_obj->atlas_width * font_obj->atlas_height * 4, 1);
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_ALPHA, font_obj->atlas_width, font_obj->atlas_height,
-                         0, GL_ALPHA, GL_UNSIGNED_BYTE, empty_data);
-            free(empty_data);
+        glBindTexture(GL_TEXTURE_2D, font_obj->atlas_tex);
 
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        }
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+
+        // Modern single-channel texture (replacing GL_ALPHA because screw GL_ALPHA)
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_ALPHA,
+                     font_obj->atlas_width, font_obj->atlas_height,
+                     0, GL_ALPHA, GL_UNSIGNED_BYTE, NULL);
+
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+        glBindTexture(GL_TEXTURE_2D, 0);
         font_obj->atlas_initialized = true;
     }
 
-    // upload pending glyphs
     if (font_obj->pending_head) {
-        gl_using_texture(GL_TEXTURE_2D, font_obj->atlas_tex) {
-            glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        glBindTexture(GL_TEXTURE_2D, font_obj->atlas_tex);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
 
-            struct pending_glyph *current = font_obj->pending_head;
-            while (current) {
-
-                if (current->bitmap_data && current->width > 0 && current->height > 0)
-                    glTexSubImage2D(GL_TEXTURE_2D, 0, current->atlas_x, current->atlas_y,
-                                    current->width, current->height, GL_ALPHA, GL_UNSIGNED_BYTE,
+        struct pending_glyph *current = font_obj->pending_head;
+        while (current) {
+            if (current->bitmap_data && current->width > 0 && current->height > 0) {
+                glTexSubImage2D(GL_TEXTURE_2D, 0,
+                                    current->atlas_x, current->atlas_y,
+                                    current->width, current->height,
+                                    GL_ALPHA, GL_UNSIGNED_BYTE,
                                     current->bitmap_data);
-
-                // free bitmap data and move to next pending glyph
-                free(current->bitmap_data);
-                struct pending_glyph *next = current->next;
-                free(current);
-                current = next;
             }
 
-            font_obj->pending_head = font_obj->pending_tail = NULL;
+            free(current->bitmap_data);
+            struct pending_glyph *next = current->next;
+            free(current);
+            current = next;
         }
+
+        font_obj->pending_head = font_obj->pending_tail = NULL;
+        glBindTexture(GL_TEXTURE_2D, 0);
     }
 }
 
@@ -962,9 +985,18 @@ static void
 draw_frame(struct scene *scene) {
     // The OpenGL context must be current.
 
+    // Update animations
+    if (scene->anim_mgr) {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        double current_time = ts.tv_sec + ts.tv_nsec / 1000000000.0;
+        animation_manager_update(scene->anim_mgr, current_time);
+    }
+
     glClearColor(0, 0, 0, 0);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
+    glViewport(0, 0, scene->ui->width, scene->ui->height);
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
@@ -1219,6 +1251,12 @@ scene_create(struct config *cfg, struct server_gl *gl, struct server_ui *ui) {
     wl_list_init(&scene->objects.unsorted_mirrors);
     wl_list_init(&scene->objects.unsorted_text);
 
+    // Initialize animation manager
+    scene->anim_mgr = animation_manager_create(scene, gl);
+    if (!scene->anim_mgr) {
+        ww_log(LOG_WARN, "failed to create animation manager, animated images will be disabled");
+    }
+
     return scene;
 
 fail_compile_texture_copy:
@@ -1271,6 +1309,12 @@ scene_destroy(struct scene *scene) {
     FT_Done_FreeType(scene->font.ft);
 
     free(scene->font.fonts);
+
+    // Destroy animation manager
+    if (scene->anim_mgr) {
+        animation_manager_destroy(scene->anim_mgr);
+    }
+
     free(scene);
 }
 
@@ -1322,6 +1366,51 @@ scene_add_image_from_atlas(struct scene *scene,
     object_add(scene, (struct scene_object *)image, SCENE_OBJECT_IMAGE);
 
     image->object.enabled = true;
+
+    return image;
+}
+
+struct scene_image *
+scene_add_animated_image(struct scene *scene, const struct scene_animated_image_options *options,
+                        const char *avif_path) {
+    if (!scene->anim_mgr) {
+        ww_log(LOG_ERROR, "animation manager not initialized, cannot create animated image");
+        return NULL;
+    }
+
+    struct scene_image *image = zalloc(1, sizeof(*image));
+
+    image->parent = scene;
+    image->is_atlas_texture = false;
+    image->is_animated = true;
+
+    // Create animation
+    image->animation = animation_create(scene->anim_mgr, avif_path);
+    if (!image->animation) {
+        ww_log(LOG_ERROR, "failed to create animation from: %s", avif_path);
+        free(image);
+        return NULL;
+    }
+
+    image->width = image->animation->width;
+    image->height = image->animation->height;
+
+    // Find correct shader for this image
+    image->shader_index = shader_find_index(scene, options->shader_name);
+
+    // Build a vertex buffer containing the data for this image
+    image_build(image, scene, &(struct scene_image_options){
+        .dst = options->dst,
+        .depth = options->depth,
+        .shader_name = options->shader_name
+    }, image->width, image->height);
+
+    image->object.depth = options->depth;
+    object_add(scene, (struct scene_object *)image, SCENE_OBJECT_IMAGE);
+
+    image->object.enabled = true;
+
+    ww_log(LOG_INFO, "created animated image from: %s", avif_path);
 
     return image;
 }
@@ -1463,10 +1552,9 @@ scene_atlas_raw_image(struct scene *scene, struct Custom_atlas *atlas, const cha
 
     server_gl_with(scene->gl, false) {
         glBindTexture(GL_TEXTURE_2D, atlas->tex);
-        glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, blit_width, blit_height, GL_RGBA, GL_UNSIGNED_BYTE,
-                        png.data);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, blit_width, blit_height,
+                        GL_RGBA, GL_UNSIGNED_BYTE, png.data);
         glBindTexture(GL_TEXTURE_2D, 0);
-
         free(png.data);
     }
 }

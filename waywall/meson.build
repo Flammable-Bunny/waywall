@@ -2,6 +2,7 @@ subdir('glsl')
 subdir('lua')
 
 waywall_src = files(
+  'animation.c',
   'config/api.c',
   'config/config.c',
   'config/internal.c',
@@ -28,6 +29,7 @@ waywall_src = files(
   'server/xwayland.c',
   'server/xwayland_shell.c',
   'server/xwm.c',
+  'util/avif.c',
   'util/debug.c',
   'util/log.c',
   'util/png.c',

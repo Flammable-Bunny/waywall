@@ -44,6 +44,7 @@ xkbcommon = dependency('xkbcommon')
 egl = dependency('egl')
 glesv2 = dependency('glesv2')
 spng = dependency('spng')
+avif = dependency('libavif')
 wayland_egl = dependency('wayland-egl')
 
 xcb = dependency('xcb')
@@ -67,6 +68,7 @@ waywall_deps = [
   egl,
   glesv2,
   spng,
+  avif,
   wayland_egl,
 
   xcb,

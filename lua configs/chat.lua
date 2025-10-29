@@ -47,7 +47,7 @@ local function new_chat(channel, x, y, size)
 		chat_x           = x,
 		chat_y           = y,
 		size             = size,
-		ls               = 15,    -- line spacing (reccomended 15 minimum to prevent emote clipping)
+		ls               = 20,    -- line spacing (reccomended 15 minimum to prevent emote clipping)
 		emote_h          = 32,    -- emote height (px)
 		max_cols         = 50,    -- max chars per line
 		max_lines        = 20,    -- max visible messages

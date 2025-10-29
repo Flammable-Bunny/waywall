@@ -394,7 +394,4 @@ void animation_manager_recalculate_budget(struct animation_manager *mgr) {
     }
 
     mgr->frames_per_anim = calculated_frames;
-
-    ww_log(LOG_INFO, "recalculated animation budget: %zu frames per animation (%zu active animations)",
-           mgr->frames_per_anim, mgr->animation_count);
 }

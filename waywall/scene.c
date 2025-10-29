@@ -24,8 +24,8 @@
 #include <wayland-util.h>
 #include FT_FREETYPE_H
 
-#define FONT_ATLAS_WIDTH 1024
-#define FONT_ATLAS_HEIGHT 1024
+#define FONT_ATLAS_WIDTH 2048
+#define FONT_ATLAS_HEIGHT 2048
 
 struct vtx_shader {
     float src_pos[2];
@@ -304,15 +304,25 @@ get_glyph(struct scene *scene, const uint32_t c, const size_t font_height) {
     if (FT_Load_Char(scene->font.face, c, FT_LOAD_RENDER))
         ww_panic("Failed to load glyph U+%04X\n", c);
 
+    FT_Bitmap *bitmap = &scene->font.face->glyph->bitmap;
+
+    // Ensure we have grayscale bitmap
+    if (bitmap->pixel_mode != FT_PIXEL_MODE_GRAY)
+        ww_panic("Unexpected bitmap pixel mode %d for glyph U+%04X\n", bitmap->pixel_mode, c);
+
     struct glyph_metadata data;
-    data.width = (int)scene->font.face->glyph->bitmap.width;
-    data.height = (int)scene->font.face->glyph->bitmap.rows;
+    data.width = (int)bitmap->width;
+    data.height = (int)bitmap->rows;
     data.bearingX = scene->font.face->glyph->bitmap_left;
     data.bearingY = scene->font.face->glyph->bitmap_top;
     data.advance = scene->font.face->glyph->advance.x;
     data.character = c;
 
-    const unsigned char *buffer = scene->font.face->glyph->bitmap.buffer;
+    if (data.width == 0 || data.height == 0) {
+        return data;
+    }
+
+    const unsigned char *buffer = bitmap->buffer;
 
     // handle row wrapping
     if (font_size_obj->atlas_x + data.width > font_size_obj->atlas_width) {
@@ -330,8 +340,7 @@ get_glyph(struct scene *scene, const uint32_t c, const size_t font_height) {
 
     // create pending glyph
     struct pending_glyph *pending = malloc(sizeof(struct pending_glyph));
-    if (!pending)
-        ww_panic("Out of memory");
+    check_alloc(pending);
 
     pending->character = c;
     pending->width = data.width;
@@ -344,12 +353,18 @@ get_glyph(struct scene *scene, const uint32_t c, const size_t font_height) {
     pending->bitmap_data = NULL;
     pending->next = NULL;
 
-    if (buffer && data.width > 0 && data.height > 0) {
-        pending->bitmap_data = malloc(data.width * data.height);
-        if (pending->bitmap_data) {
-            memcpy(pending->bitmap_data, buffer, data.width * data.height);
+    // copy bitmap data
+    if (buffer) {
+        pending->bitmap_data = malloc((size_t)data.width * data.height);
+        check_alloc(pending->bitmap_data);
+        for (int row = 0; row < data.height; row++) {
+            const unsigned char *src = buffer + row * bitmap->pitch;
+            unsigned char *dst = pending->bitmap_data + (size_t)row * data.width;
+            memcpy(dst, src, data.width);
         }
     }
+
+
 
     // add to queue
     if (font_size_obj->pending_tail) {
@@ -387,31 +402,19 @@ static uint32_t
 utf8_decode(const char **str) {
     const unsigned char *s = (const unsigned char *)*str;
     uint32_t cp;
+    int len;
 
-    if (s[0] < 0x80) {
-        // 1-byte ASCII
-        cp = s[0];
-        *str += 1;
-    } else if ((s[0] & 0xE0) == 0xC0) {
-        // 2-byte
-        cp = ((s[0] & 0x1F) << 6) | (s[1] & 0x3F);
-        *str += 2;
-    } else if ((s[0] & 0xF0) == 0xE0) {
-        // 3-byte
-        cp = ((s[0] & 0x0F) << 12) | ((s[1] & 0x3F) << 6) | (s[2] & 0x3F);
-        *str += 3;
-    } else if ((s[0] & 0xF8) == 0xF0) {
-        // 4-byte
-        cp = ((s[0] & 0x07) << 18) | ((s[1] & 0x3F) << 12) | ((s[2] & 0x3F) << 6) | (s[3] & 0x3F);
-        *str += 4;
-    } else {
-        // Invalid byte, skip
-        cp = 0xFFFD; // replacement char
-        *str += 1;
-    }
+    if (s[0] < 0x80) { cp = s[0]; len = 1; }
+    else if ((s[0] & 0xE0) == 0xC0) { cp = ((s[0] & 0x1F) << 6) | (s[1] & 0x3F); len = 2; }
+    else if ((s[0] & 0xF0) == 0xE0) { cp = ((s[0] & 0x0F) << 12) | ((s[1] & 0x3F) << 6) | (s[2] & 0x3F); len = 3; }
+    else if ((s[0] & 0xF8) == 0xF0) { cp = ((s[0] & 0x07) << 18) | ((s[1] & 0x3F) << 12) |
+                                        ((s[2] & 0x3F) << 6) | (s[3] & 0x3F); len = 4; }
+    else { cp = 0xFFFD; len = 1; }
 
+    *str += len;
     return cp;
 }
+
 
 static int
 parse_hex_digit(const u_int32_t c) {
@@ -553,10 +556,8 @@ text_build(GLuint vbo, struct scene *scene, const char *data, const size_t data_
             continue;
         }
 
-        if (text_chars[i].advance != 0) {
-            x += text_chars[i].advance;
-            continue;
-        }
+        if (text_chars[i].c == 0) continue; // skip nulls
+        if (text_chars[i].advance != 0) { x += text_chars[i].advance; continue; }
 
         struct box src = {
             .x = g.atlas_x,
@@ -707,46 +708,39 @@ text_release(struct scene_object *object) {
 }
 
 static void
-process_pending_font_operations(struct scene *scene, struct font_size_obj *font_obj)
-{
+process_pending_font_operations(struct scene *scene, struct font_size_obj *font_obj) {
+    // Initialize font atlas texture if not yet created
     if (!font_obj->atlas_initialized) {
         glGenTextures(1, &font_obj->atlas_tex);
         glBindTexture(GL_TEXTURE_2D, font_obj->atlas_tex);
-
         glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-
-        // Modern single-channel texture (replacing GL_ALPHA because screw GL_ALPHA)
         glTexImage2D(GL_TEXTURE_2D, 0, GL_ALPHA,
                      font_obj->atlas_width, font_obj->atlas_height,
                      0, GL_ALPHA, GL_UNSIGNED_BYTE, NULL);
-
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-
         glBindTexture(GL_TEXTURE_2D, 0);
         font_obj->atlas_initialized = true;
     }
 
+    // Upload pending glyphs into the atlas texture
     if (font_obj->pending_head) {
         glBindTexture(GL_TEXTURE_2D, font_obj->atlas_tex);
         glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
 
-        struct pending_glyph *current = font_obj->pending_head;
-        while (current) {
-            if (current->bitmap_data && current->width > 0 && current->height > 0) {
+        struct pending_glyph *cur = font_obj->pending_head;
+        while (cur) {
+            if (cur->bitmap_data && cur->width > 0 && cur->height > 0) {
                 glTexSubImage2D(GL_TEXTURE_2D, 0,
-                                    current->atlas_x, current->atlas_y,
-                                    current->width, current->height,
-                                    GL_ALPHA, GL_UNSIGNED_BYTE,
-                                    current->bitmap_data);
+                                cur->atlas_x, cur->atlas_y,
+                                cur->width, cur->height,
+                                GL_ALPHA, GL_UNSIGNED_BYTE,
+                                cur->bitmap_data);
             }
-
-            free(current->bitmap_data);
-            struct pending_glyph *next = current->next;
-            free(current);
-            current = next;
+            free(cur->bitmap_data);
+            struct pending_glyph *next = cur->next;
+            free(cur);
+            cur = next;
         }
 
         font_obj->pending_head = font_obj->pending_tail = NULL;
@@ -773,6 +767,9 @@ text_render(struct scene_object *object) {
 
     process_pending_font_operations(scene, font_obj);
 
+    if (!font_obj->atlas_tex)
+        return;
+
     server_gl_shader_use(scene->shaders.data[text->shader_index].shader);
     glUniform2f(scene->shaders.data[text->shader_index].shader_u_dst_size, scene->ui->width,
                 scene->ui->height);
@@ -781,6 +778,8 @@ text_render(struct scene_object *object) {
 
     gl_using_buffer(GL_ARRAY_BUFFER, text->vbo) {
         gl_using_texture(GL_TEXTURE_2D, font_obj->atlas_tex) {
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
             draw_vertex_list(&scene->shaders.data[text->shader_index], text->vtxcount);
         }
     }
@@ -999,8 +998,6 @@ draw_frame(struct scene *scene) {
     glViewport(0, 0, scene->ui->width, scene->ui->height);
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-
-    glViewport(0, 0, scene->ui->width, scene->ui->height);
 
     if (!should_draw_frame(scene)) {
         scene->skipped_frames++;

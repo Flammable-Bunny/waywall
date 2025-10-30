@@ -781,6 +781,10 @@ text_render(struct scene_object *object) {
             glEnable(GL_BLEND);
             glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
             draw_vertex_list(&scene->shaders.data[text->shader_index], text->vtxcount);
+
+            for (size_t i = 0; i < scene->font.fonts_len; i++) {
+                process_pending_font_operations(scene, &scene->font.fonts[i]);
+            }
         }
     }
 }

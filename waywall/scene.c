@@ -1407,8 +1407,6 @@ scene_add_animated_image(struct scene *scene, const struct scene_animated_image_
 
     image->object.enabled = true;
 
-    ww_log(LOG_INFO, "created animated image from: %s", avif_path);
-
     return image;
 }
 

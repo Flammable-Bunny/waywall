@@ -36,7 +36,7 @@ end
 local atlas_filename    = "/home/bunny/.config/waywall/atlas.raw"
 local emoteset_filename = "/home/bunny/.config/waywall/emoteset.json"
 
--- === Optional Twitch set ===
+-- === Optional Twitch set, uncomment this and bottom part to download Twitch emote sets. ===
 -- local twitch_atlas_filename  = "/home/bunny/.config/waywall/atlas_twitch.raw"
 -- local twitch_json_filename   = "/home/bunny/.config/waywall/emoteset_twitch.json"
 

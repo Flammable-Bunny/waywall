@@ -781,10 +781,6 @@ text_render(struct scene_object *object) {
             glEnable(GL_BLEND);
             glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
             draw_vertex_list(&scene->shaders.data[text->shader_index], text->vtxcount);
-
-            for (size_t i = 0; i < scene->font.fonts_len; i++) {
-                process_pending_font_operations(scene, &scene->font.fonts[i]);
-            }
         }
     }
 }
@@ -960,6 +956,13 @@ draw_debug_text(struct scene *scene) {
     scene->buffers.debug_vtxcount =
         text_build(scene->buffers.debug, scene, str, strlen(str),
                    &(struct scene_text_options){.x = 8, .y = 8, .size = 20, .shader_name = NULL});
+
+    for (size_t i = 0; i < scene->font.fonts_len; i++) {
+            if (scene->font.fonts[i].font_height == 20) {
+                process_pending_font_operations(scene, &scene->font.fonts[i]);
+                break;
+            }
+        }
 
     GLuint atlas_texture = 0;
     for (size_t i = 0; i < scene->font.fonts_len; i++) {
@@ -1453,6 +1456,9 @@ scene_add_text(struct scene *scene, const char *data, const struct scene_text_op
         ww_assert(text->vbo);
 
         text->vtxcount = text_build(text->vbo, scene, data, strlen(data), options);
+        for (size_t i = 0; i < scene->font.fonts_len; i++) {
+                process_pending_font_operations(scene, &scene->font.fonts[i]);
+        }
     }
 
     text->object.depth = options->depth;

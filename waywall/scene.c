@@ -556,8 +556,14 @@ text_build(GLuint vbo, struct scene *scene, const char *data, const size_t data_
             continue;
         }
 
-        if (text_chars[i].c == 0) continue; // skip nulls
-        if (text_chars[i].advance != 0) { x += text_chars[i].advance; continue; }
+        // Handle advance-only characters (emote spacing)
+        if (text_chars[i].advance != 0) {
+            x += text_chars[i].advance;
+            continue;
+        }
+
+        // Skip null characters that aren't advance-only
+        if (text_chars[i].c == 0) continue;
 
         struct box src = {
             .x = g.atlas_x,
@@ -622,7 +628,6 @@ text_get_advance(struct scene *scene, const char *data, const size_t data_len,
         int advance;
     };
     struct text_char *text_chars = zalloc(16, sizeof(struct text_char));
-    int pending_advance = 0;
 
     for (size_t i = 0; i < cps_len; i++) {
         if (i + 1 < cps_len && cps[i] == '<' && cps[i + 1] == '#') {
@@ -647,7 +652,20 @@ text_get_advance(struct scene *scene, const char *data, const size_t data_len,
             }
             buf[k] = '\0';
             if (cps[j] == '>') {
-                pending_advance = atoi(buf);
+                int adv = atoi(buf);
+
+                if (next_index >= capacity) {
+                    capacity *= 2;
+                    struct text_char *tmp = realloc(text_chars, capacity * sizeof(*text_chars));
+                    if (!tmp)
+                        ww_panic("Out of memory");
+                    text_chars = tmp;
+                }
+
+                text_chars[next_index].c = 0;
+                text_chars[next_index].advance = adv;
+                next_index++;
+
                 i = j;
                 continue;
             }
@@ -662,9 +680,8 @@ text_get_advance(struct scene *scene, const char *data, const size_t data_len,
         }
 
         text_chars[next_index].c = cps[i];
-        text_chars[next_index].advance = pending_advance;
+        text_chars[next_index].advance = 0;
         next_index++;
-        pending_advance = 0;
     }
 
     free(cps);
@@ -683,7 +700,14 @@ text_get_advance(struct scene *scene, const char *data, const size_t data_len,
             continue;
         }
 
-        x += text_chars[i].advance;
+        // Handle advance-only characters (emote spacing)
+        if (text_chars[i].advance != 0) {
+            x += text_chars[i].advance;
+            continue;
+        }
+
+        // Skip null characters that aren't advance-only
+        if (ch == 0) continue;
 
         struct glyph_metadata glyph = get_glyph(scene, ch, size);
         x += (int)(glyph.advance >> 6);

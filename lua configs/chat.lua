@@ -111,10 +111,12 @@ local function new_chat(channel, x, y, size)
 				word = strip_invisible(word)
 				local e = CHAT.emote_set[word]
 				if e then
-					local advance = waywall.text_advance(text_buf .. prefix .. body, CHAT.size)
+					-- Calculate position for THIS LINE ONLY (prefix + body so far)
+					local advance = waywall.text_advance(prefix .. body, CHAT.size)
 					local emote_h = CHAT.emote_h
 					local emote_w = emote_h * (e.w / e.h)
-					body = body .. "<+" .. emote_w .. "> "
+					local spacing_before = 3
+					local spacing_after = 6
 
 					local line_h = CHAT.size + CHAT.ls
 					local line_top = CHAT.chat_y + current_line * line_h - CHAT.size / 2
@@ -123,16 +125,19 @@ local function new_chat(channel, x, y, size)
 					local img
 					if e.animated then
 						img = waywall.animated_image(e.path, {
-							dst = { x = advance.x + CHAT.chat_x, y = emote_y, w = emote_w, h = emote_h },
+							dst = { x = advance.x + CHAT.chat_x + spacing_before, y = emote_y, w = emote_w, h = emote_h },
 						})
 					else
 						img = waywall.image_a({
 							src   = { x = e.x, y = e.y, w = e.w, h = e.h },
-							dst   = { x = advance.x + CHAT.chat_x, y = emote_y, w = emote_w, h = emote_h },
+							dst   = { x = advance.x + CHAT.chat_x + spacing_before, y = emote_y, w = emote_w, h = emote_h },
 							atlas = CHAT.emote_atlas,
 						})
 					end
 					if img then table.insert(CHAT.emote_images, img) end
+
+					-- NOW add the spacing to push next text past the emote
+					body = body .. "<+" .. (emote_w + spacing_before + spacing_after) .. ">"
 				else
 					body = body .. word .. " "
 				end

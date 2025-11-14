@@ -119,8 +119,9 @@ local function new_chat(channel, x, y, size)
 					local spacing_after = 6
 
 					local line_h = CHAT.size + CHAT.ls
-					local line_top = CHAT.chat_y + current_line * line_h - CHAT.size / 2
-					local emote_y = line_top - (CHAT.emote_h - CHAT.size) / 2
+					local text_baseline_y = CHAT.chat_y + CHAT.size + current_line * line_h
+					-- Center emote vertically with text
+					local emote_y = text_baseline_y - emote_h / 2 - CHAT.size / 2
 
 					local img
 					if e.animated then

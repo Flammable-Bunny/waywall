@@ -80,6 +80,14 @@ subproc_destroy(struct subproc *subproc) {
 
 void
 subproc_exec(struct subproc *subproc, char *cmd[static 64]) {
+    // Log environment variables for debugging
+    const char *display = getenv("DISPLAY");
+    const char *wayland_display = getenv("WAYLAND_DISPLAY");
+    ww_log(LOG_INFO, "subproc_exec: DISPLAY=%s, WAYLAND_DISPLAY=%s, cmd=%s",
+           display ? display : "(null)",
+           wayland_display ? wayland_display : "(null)",
+           cmd[0]);
+
     pid_t pid = fork();
     if (pid == 0) {
         // Child process
@@ -91,6 +99,15 @@ subproc_exec(struct subproc *subproc, char *cmd[static 64]) {
         if (dup2(out, STDOUT_FILENO) == -1) {
             ww_log_errno(LOG_ERROR, "failed to duplicate /dev/null to stdout in child process");
             exit(EXIT_FAILURE);
+        }
+
+        // Explicitly set environment variables in child to ensure they're correct
+        // This fixes issues on some systems (like NixOS) where environment may be modified
+        if (display) {
+            setenv("DISPLAY", display, 1);
+        }
+        if (wayland_display) {
+            setenv("WAYLAND_DISPLAY", wayland_display, 1);
         }
 
         execvp(cmd[0], cmd);

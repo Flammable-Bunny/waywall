@@ -381,7 +381,10 @@ on_view_create(struct wl_listener *listener, void *data) {
 
     // HACK: This is so that scene objects (images, mirrors, text) appear over the instance. This is
     // probably not the best spot to do it, though.
-    wl_subsurface_place_below(wrap->view->subsurface, wrap->view->ui->tree.surface);
+    // Skip if force_composition is enabled (subsurface won't exist).
+    if (wrap->view->subsurface) {
+        wl_subsurface_place_below(wrap->view->subsurface, wrap->view->ui->tree.surface);
+    }
 
     server_gl_set_capture(wrap->gl, view->surface);
 }

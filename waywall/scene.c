@@ -1005,10 +1005,45 @@ draw_debug_text(struct scene *scene) {
 
 static inline bool
 should_draw_frame(struct scene *scene) {
-    return util_debug_enabled || wl_list_length(&scene->objects.sorted) ||
+    // Always draw when force_composition is enabled (cross-GPU mode)
+    return scene->force_composition || util_debug_enabled ||
+           wl_list_length(&scene->objects.sorted) ||
            wl_list_length(&scene->objects.unsorted_text) ||
            wl_list_length(&scene->objects.unsorted_mirrors) ||
            wl_list_length(&scene->objects.unsorted_images);
+}
+
+// Draw the captured game content as visible background (for force_composition mode)
+static void
+draw_capture_background(struct scene *scene) {
+    int32_t width, height;
+    GLuint tex = server_gl_get_capture(scene->gl);
+    if (tex == 0) {
+        return;
+    }
+    server_gl_get_capture_size(scene->gl, &width, &height);
+
+    // Center the game in the window (same calculation as draw_stencil)
+    struct box dst = {
+        .x = (scene->ui->width / 2) - (width / 2),
+        .y = (scene->ui->height / 2) - (height / 2),
+        .width = width,
+        .height = height,
+    };
+
+    struct vtx_shader buf[6];
+    rect_build(buf, &(struct box){0, 0, width, height}, &dst, (float[4]){0}, (float[4]){0});
+
+    server_gl_shader_use(scene->shaders.data[0].shader);
+    glUniform2f(scene->shaders.data[0].shader_u_dst_size, scene->ui->width, scene->ui->height);
+    glUniform2f(scene->shaders.data[0].shader_u_src_size, width, height);
+
+    gl_using_buffer(GL_ARRAY_BUFFER, scene->buffers.stencil_rect) {
+        gl_using_texture(GL_TEXTURE_2D, tex) {
+            glBufferData(GL_ARRAY_BUFFER, sizeof(buf), buf, GL_STREAM_DRAW);
+            draw_vertex_list(&scene->shaders.data[0], 6);
+        }
+    }
 }
 
 static void
@@ -1039,22 +1074,36 @@ draw_frame(struct scene *scene) {
         scene->skipped_frames = 0;
     }
 
-    draw_stencil(scene);
-    glStencilFunc(GL_NOTEQUAL, 1, 0xFF);
-    glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
-
     struct scene_object *object;
     struct wl_list *positive_depth = NULL;
-    glEnable(GL_STENCIL_TEST);
-    wl_list_for_each (object, &scene->objects.sorted, link) {
-        if (object->depth >= 0) {
-            positive_depth = object->link.prev;
-            break;
-        }
 
-        object_render(object);
+    // In force_composition mode, draw the capture directly as background.
+    // Skip stencil masking since we're drawing the game ourselves and overlays go on top.
+    if (scene->force_composition) {
+        draw_capture_background(scene);
+
+        // Draw all scene objects on top of the game (no stencil test needed)
+        wl_list_for_each (object, &scene->objects.sorted, link) {
+            if (object->enabled)
+                object_render(object);
+        }
+    } else {
+        // Normal mode: use stencil to prevent overlays from covering subsurface game area
+        draw_stencil(scene);
+        glStencilFunc(GL_NOTEQUAL, 1, 0xFF);
+        glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
+
+        glEnable(GL_STENCIL_TEST);
+        wl_list_for_each (object, &scene->objects.sorted, link) {
+            if (object->depth >= 0) {
+                positive_depth = object->link.prev;
+                break;
+            }
+
+            object_render(object);
+        }
+        glDisable(GL_STENCIL_TEST);
     }
-    glDisable(GL_STENCIL_TEST);
 
     wl_list_for_each (object, &scene->objects.unsorted_mirrors, link) {
         if (object->enabled)
@@ -1221,6 +1270,7 @@ scene_create(struct config *cfg, struct server_gl *gl, struct server_ui *ui) {
 
     scene->gl = gl;
     scene->ui = ui;
+    scene->force_composition = cfg->experimental.force_composition;
 
     // Initialize OpenGL resources.
     server_gl_with(scene->gl, false) {

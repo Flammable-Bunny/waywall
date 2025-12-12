@@ -185,6 +185,16 @@ struct server *
 server_create(struct config *cfg) {
     struct server *server = zalloc(1, sizeof(*server));
 
+    server->force_composition = cfg->experimental.force_composition;
+    if (server->force_composition) {
+        ww_log(LOG_INFO, "force_composition enabled: using local GL composition for cross-GPU support");
+    }
+
+    server->subprocess_dri_prime = cfg->experimental.subprocess_dri_prime ? strdup(cfg->experimental.subprocess_dri_prime) : NULL;
+    if (server->subprocess_dri_prime) {
+        ww_log(LOG_INFO, "subprocess DRI_PRIME=%s configured for cross-GPU rendering", server->subprocess_dri_prime);
+    }
+
     wl_signal_init(&server->events.input_focus);
     wl_signal_init(&server->events.map_status);     // used by server_ui
     wl_signal_init(&server->events.pointer_lock);   // used by server_pointer_constraints
@@ -228,9 +238,15 @@ server_create(struct config *cfg) {
     if (!server->data_device_manager) {
         goto fail_globals;
     }
-    server->linux_dmabuf = server_linux_dmabuf_create(server);
-    if (!server->linux_dmabuf) {
-        goto fail_globals;
+    // Allow disabling dmabuf for cross-GPU setups (forces wl_shm fallback)
+    if (!cfg->experimental.no_dmabuf) {
+        server->linux_dmabuf = server_linux_dmabuf_create(server);
+        if (!server->linux_dmabuf) {
+            goto fail_globals;
+        }
+    } else {
+        ww_log(LOG_INFO, "linux_dmabuf disabled via experimental.no_dmabuf config");
+        server->linux_dmabuf = NULL;
     }
     server->pointer_constraints = server_pointer_constraints_create(server, cfg);
     if (!server->pointer_constraints) {

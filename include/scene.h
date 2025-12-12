@@ -77,6 +77,8 @@ struct scene {
     struct server_gl *gl;
     struct server_ui *ui;
 
+    bool force_composition; // Draw capture as background (for cross-GPU support)
+
     uint32_t image_max_size;
 
     struct {

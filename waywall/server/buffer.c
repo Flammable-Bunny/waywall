@@ -63,7 +63,9 @@ server_buffer_create(struct wl_resource *resource, struct wl_buffer *remote,
     buffer->lockcount = 0;
 
     wl_resource_set_implementation(resource, &server_buffer_impl, buffer, buffer_resource_destroy);
-    wl_buffer_add_listener(remote, &server_buffer_listener, buffer);
+    if (remote) {
+        wl_buffer_add_listener(remote, &server_buffer_listener, buffer);
+    }
 
     wl_signal_init(&buffer->events.resource_destroy);
 

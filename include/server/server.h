@@ -11,6 +11,9 @@ struct server {
     struct server_backend *backend;
     struct server_ui *ui;
 
+    bool force_composition; // Force local GL composition (for cross-GPU setups)
+    char *subprocess_dri_prime; // DRI_PRIME value for subprocess (for cross-GPU setups)
+
     struct server_view *input_focus;
     struct wl_listener on_view_destroy;
 

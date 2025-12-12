@@ -10,6 +10,7 @@
 
 struct server_linux_dmabuf {
     struct wl_global *global;
+    struct server *server;
 
     struct wl_display *remote_display;
     struct zwp_linux_dmabuf_v1 *remote; // wrapped (server_linux_dmabuf.queue)

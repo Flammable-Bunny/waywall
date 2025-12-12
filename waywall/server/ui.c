@@ -571,27 +571,31 @@ server_view_commit(struct server_view *view) {
         view->impl->set_size(view->impl_data, view->current.width, view->current.height);
     }
 
-    if (visibility_changed && view->current.visible) {
-        ww_assert(!view->subsurface);
+    // Skip subsurface creation when force_composition is enabled (for cross-GPU support).
+    // In this mode, the game is rendered via GL scene composition instead of direct buffer proxy.
+    if (!view->ui->server->force_composition) {
+        if (visibility_changed && view->current.visible) {
+            ww_assert(!view->subsurface);
 
-        view->subsurface =
-            wl_subcompositor_get_subsurface(view->ui->server->backend->subcompositor,
-                                            view->surface->remote, view->ui->tree.surface);
-        check_alloc(view->subsurface);
+            view->subsurface =
+                wl_subcompositor_get_subsurface(view->ui->server->backend->subcompositor,
+                                                view->surface->remote, view->ui->tree.surface);
+            check_alloc(view->subsurface);
 
-        wl_subsurface_set_desync(view->subsurface);
-    } else if (visibility_changed && !view->current.visible) {
-        ww_assert(view->subsurface);
+            wl_subsurface_set_desync(view->subsurface);
+        } else if (visibility_changed && !view->current.visible) {
+            ww_assert(view->subsurface);
 
-        wl_subsurface_destroy(view->subsurface);
-        view->subsurface = NULL;
-    }
+            wl_subsurface_destroy(view->subsurface);
+            view->subsurface = NULL;
+        }
 
-    if (view->subsurface) {
-        if (view->current.centered) {
-            layout_centered(view);
-        } else {
-            layout_floating(view);
+        if (view->subsurface) {
+            if (view->current.centered) {
+                layout_centered(view);
+            } else {
+                layout_floating(view);
+            }
         }
     }
 

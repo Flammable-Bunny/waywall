@@ -110,6 +110,16 @@ subproc_exec(struct subproc *subproc, char *cmd[static 64]) {
             setenv("WAYLAND_DISPLAY", wayland_display, 1);
         }
 
+        // Set DRI_PRIME for cross-GPU rendering if configured
+        if (subproc->server->subprocess_dri_prime) {
+            setenv("DRI_PRIME", subproc->server->subprocess_dri_prime, 1);
+            // Force linear modifier for cross-GPU dmabuf compatibility
+            // DRM_FORMAT_MOD_LINEAR = 0x0
+            setenv("INTEL_MODIFIER_OVERRIDE", "0x0", 1);
+            ww_log(LOG_INFO, "subprocess: setting DRI_PRIME=%s for cross-GPU rendering",
+                   subproc->server->subprocess_dri_prime);
+        }
+
         execvp(cmd[0], cmd);
         ww_log_errno(LOG_ERROR, "failed to execvp() in child porcess");
         exit(EXIT_FAILURE);

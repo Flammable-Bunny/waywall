@@ -12,6 +12,9 @@ struct config {
         bool debug;
         bool jit;
         bool tearing;
+        bool no_dmabuf;         // Disable linux_dmabuf, force wl_shm (for cross-GPU setups)
+        bool force_composition; // Force local GL composition instead of buffer proxying (for cross-GPU)
+        char *subprocess_dri_prime; // DRI_PRIME value to set for subprocess (e.g. "1" or "pci-0000:03:00.0")
     } experimental;
 
     struct {

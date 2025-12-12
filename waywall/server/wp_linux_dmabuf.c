@@ -6,10 +6,24 @@
 #include "server/server.h"
 #include "server/wl_compositor.h"
 #include "util/alloc.h"
+#include "util/log.h"
 #include "util/prelude.h"
 #include <inttypes.h>
 #include <stdlib.h>
+#include <string.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/sysmacros.h>
 #include <unistd.h>
+
+// DRM format codes
+#define DRM_FORMAT_XRGB8888 0x34325258
+#define DRM_FORMAT_ARGB8888 0x34325241
+#define DRM_FORMAT_XBGR8888 0x34324258
+#define DRM_FORMAT_ABGR8888 0x34324241
+
+// DRM_FORMAT_MOD_LINEAR
+#define DRM_FORMAT_MOD_LINEAR 0ULL
 #include <wayland-client-core.h>
 #include <wayland-client-protocol.h>
 #include <wayland-util.h>
@@ -82,6 +96,16 @@ create_buffer(struct server_linux_buffer_params *buffer_params, struct wl_resour
     buffer_params->data->format = format;
     buffer_params->data->flags = flags;
 
+    // In force_composition mode (cross-GPU), don't proxy dmabuf to parent compositor.
+    // Instead, create buffer locally - it will be imported via EGL in server_gl.
+    if (buffer_params->parent->server->force_composition) {
+        // Create buffer without remote wl_buffer - EGL import will handle it
+        buffer_params->buffer = server_buffer_create(buffer_resource, NULL,
+                                                     &dmabuf_buffer_impl, buffer_params->data);
+        buffer_params->status = BUFFER_PARAMS_STATUS_OK;
+        return;
+    }
+
     zwp_linux_buffer_params_v1_create(buffer_params->remote, width, height, format, flags);
     wl_display_roundtrip_queue(buffer_params->parent->remote_display, buffer_params->parent->queue);
 
@@ -132,13 +156,72 @@ on_linux_dmabuf_feedback_done(void *data, struct zwp_linux_dmabuf_feedback_v1 *w
     zwp_linux_dmabuf_feedback_v1_send_done(feedback->resource);
 }
 
+// Format table entry structure (16 bytes per entry)
+struct format_table_entry {
+    uint32_t format;
+    uint32_t padding;
+    uint64_t modifier;
+};
+
 static void
 on_linux_dmabuf_feedback_format_table(void *data, struct zwp_linux_dmabuf_feedback_v1 *wl,
                                       int32_t fd, uint32_t size) {
     struct server_linux_dmabuf_feedback *feedback = data;
 
-    zwp_linux_dmabuf_feedback_v1_send_format_table(feedback->resource, fd, size);
-    close(fd);
+    // HACK: Create a new format table with only LINEAR modifier formats for cross-GPU compatibility
+    // Common formats that both AMD and Intel support with LINEAR modifier
+    static const uint32_t linear_formats[] = {
+        DRM_FORMAT_XRGB8888,
+        DRM_FORMAT_ARGB8888,
+        DRM_FORMAT_XBGR8888,
+        DRM_FORMAT_ABGR8888,
+    };
+    static const size_t num_formats = sizeof(linear_formats) / sizeof(linear_formats[0]);
+
+    size_t new_size = num_formats * sizeof(struct format_table_entry);
+
+    // Create temp file for format table (deleted immediately but fd kept open)
+    char template[] = "/tmp/dmabuf-fmt-XXXXXX";
+    int new_fd = mkstemp(template);
+    if (new_fd < 0) {
+        ww_log(LOG_ERROR, "Failed to create temp file for format table, falling back to original");
+        zwp_linux_dmabuf_feedback_v1_send_format_table(feedback->resource, fd, size);
+        close(fd);
+        return;
+    }
+    unlink(template);  // Delete file but keep fd open
+
+    if (ftruncate(new_fd, new_size) < 0) {
+        ww_log(LOG_ERROR, "Failed to resize format table file");
+        close(new_fd);
+        zwp_linux_dmabuf_feedback_v1_send_format_table(feedback->resource, fd, size);
+        close(fd);
+        return;
+    }
+
+    struct format_table_entry *table = mmap(NULL, new_size, PROT_READ | PROT_WRITE, MAP_SHARED, new_fd, 0);
+    if (table == MAP_FAILED) {
+        ww_log(LOG_ERROR, "Failed to mmap format table");
+        close(new_fd);
+        zwp_linux_dmabuf_feedback_v1_send_format_table(feedback->resource, fd, size);
+        close(fd);
+        return;
+    }
+
+    // Fill in format table with LINEAR modifier only
+    for (size_t i = 0; i < num_formats; i++) {
+        table[i].format = linear_formats[i];
+        table[i].padding = 0;
+        table[i].modifier = DRM_FORMAT_MOD_LINEAR;
+    }
+
+    munmap(table, new_size);
+
+    ww_log(LOG_INFO, "dmabuf feedback: replaced format table with %zu LINEAR-only formats", num_formats);
+
+    zwp_linux_dmabuf_feedback_v1_send_format_table(feedback->resource, new_fd, new_size);
+    close(new_fd);
+    close(fd);  // Close original fd
 }
 
 static void
@@ -146,7 +229,21 @@ on_linux_dmabuf_feedback_main_device(void *data, struct zwp_linux_dmabuf_feedbac
                                      struct wl_array *device) {
     struct server_linux_dmabuf_feedback *feedback = data;
 
-    zwp_linux_dmabuf_feedback_v1_send_main_device(feedback->resource, device);
+    // Log the original device
+    if (device->size >= sizeof(dev_t)) {
+        dev_t *dev = device->data;
+        ww_log(LOG_INFO, "dmabuf feedback main_device (original): %d:%d", major(*dev), minor(*dev));
+    }
+
+    // HACK: Override main_device to Intel (renderD128 = 226:128) for cross-GPU testing
+    struct wl_array override_device;
+    wl_array_init(&override_device);
+    dev_t *new_dev = wl_array_add(&override_device, sizeof(dev_t));
+    *new_dev = makedev(226, 128);  // Intel renderD128
+    ww_log(LOG_INFO, "dmabuf feedback main_device (override): %d:%d", major(*new_dev), minor(*new_dev));
+
+    zwp_linux_dmabuf_feedback_v1_send_main_device(feedback->resource, &override_device);
+    wl_array_release(&override_device);
 }
 
 static void
@@ -169,7 +266,20 @@ on_linux_dmabuf_feedback_tranche_formats(void *data, struct zwp_linux_dmabuf_fee
                                          struct wl_array *indices) {
     struct server_linux_dmabuf_feedback *feedback = data;
 
-    zwp_linux_dmabuf_feedback_v1_send_tranche_formats(feedback->resource, indices);
+    // HACK: Override tranche_formats to use indices 0-3 (our 4 LINEAR formats)
+    struct wl_array override_indices;
+    wl_array_init(&override_indices);
+
+    // Add indices 0, 1, 2, 3 for our 4 LINEAR format entries
+    for (uint16_t i = 0; i < 4; i++) {
+        uint16_t *idx = wl_array_add(&override_indices, sizeof(uint16_t));
+        *idx = i;
+    }
+
+    ww_log(LOG_INFO, "dmabuf feedback: replaced tranche_formats with LINEAR-only indices (0-3)");
+
+    zwp_linux_dmabuf_feedback_v1_send_tranche_formats(feedback->resource, &override_indices);
+    wl_array_release(&override_indices);
 }
 
 static void
@@ -177,7 +287,21 @@ on_linux_dmabuf_feedback_tranche_target_device(void *data, struct zwp_linux_dmab
                                                struct wl_array *device) {
     struct server_linux_dmabuf_feedback *feedback = data;
 
-    zwp_linux_dmabuf_feedback_v1_send_tranche_target_device(feedback->resource, device);
+    // Log the original device
+    if (device->size >= sizeof(dev_t)) {
+        dev_t *dev = device->data;
+        ww_log(LOG_INFO, "dmabuf feedback tranche_target_device (original): %d:%d", major(*dev), minor(*dev));
+    }
+
+    // HACK: Override to Intel (renderD128 = 226:128) for cross-GPU testing
+    struct wl_array override_device;
+    wl_array_init(&override_device);
+    dev_t *new_dev = wl_array_add(&override_device, sizeof(dev_t));
+    *new_dev = makedev(226, 128);  // Intel renderD128
+    ww_log(LOG_INFO, "dmabuf feedback tranche_target_device (override): %d:%d", major(*new_dev), minor(*new_dev));
+
+    zwp_linux_dmabuf_feedback_v1_send_tranche_target_device(feedback->resource, &override_device);
+    wl_array_release(&override_device);
 }
 
 static const struct zwp_linux_dmabuf_feedback_v1_listener linux_dmabuf_feedback_listener = {
@@ -234,12 +358,21 @@ linux_buffer_params_add(struct wl_client *client, struct wl_resource *resource, 
     buffer_params->data->planes[plane_idx].fd = fd;
     buffer_params->data->planes[plane_idx].offset = offset;
     buffer_params->data->planes[plane_idx].stride = stride;
-    buffer_params->data->modifier_lo = modifier_lo;
-    buffer_params->data->modifier_hi = modifier_hi;
+
+    // HACK: Force LINEAR modifier for cross-GPU compatibility
+    // Minecraft may use tiled modifiers that AMD can't import, so we force LINEAR
+    // which both AMD and Intel support with our CPU copy fallback
+    uint32_t forced_modifier_lo = 0;
+    uint32_t forced_modifier_hi = 0;
+
+    buffer_params->data->modifier_lo = forced_modifier_lo;
+    buffer_params->data->modifier_hi = forced_modifier_hi;
 
     buffer_params->data->num_planes++;
+    ww_log(LOG_INFO, "Cross-GPU: Forcing LINEAR modifier (was %#" PRIx32 ":%#" PRIx32 ")",
+           modifier_hi, modifier_lo);
     zwp_linux_buffer_params_v1_add(buffer_params->remote, fd, plane_idx, offset, stride,
-                                   modifier_hi, modifier_lo);
+                                   forced_modifier_hi, forced_modifier_lo);
 }
 
 static void
@@ -458,6 +591,7 @@ on_display_destroy(struct wl_listener *listener, void *data) {
 struct server_linux_dmabuf *
 server_linux_dmabuf_create(struct server *server) {
     struct server_linux_dmabuf *linux_dmabuf = zalloc(1, sizeof(*linux_dmabuf));
+    linux_dmabuf->server = server;
 
     linux_dmabuf->global = wl_global_create(server->display, &zwp_linux_dmabuf_v1_interface,
                                             SRV_LINUX_DMABUF_VERSION, linux_dmabuf, on_global_bind);

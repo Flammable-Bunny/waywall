@@ -403,7 +403,10 @@ gl_buffer_import(struct server_gl *gl, struct server_buffer *buffer) {
     gl_buffer->image = gl_buffer->gl->egl.CreateImageKHR(
         gl_buffer->gl->egl.display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, NULL, image_attributes);
     if (gl_buffer->image == EGL_NO_IMAGE_KHR) {
-        ww_log_egl(LOG_ERROR, "failed to create EGLImage for dmabuf");
+        uint64_t modifier = ((uint64_t)data->modifier_hi << 32) | data->modifier_lo;
+        ww_log(LOG_ERROR, "failed to create EGLImage for dmabuf: format=0x%x, %dx%d, modifier=0x%llx, planes=%d",
+               data->format, data->width, data->height, (unsigned long long)modifier, data->num_planes);
+        ww_log_egl(LOG_ERROR, "EGL error");
         goto fail_create_orig;
     }
 

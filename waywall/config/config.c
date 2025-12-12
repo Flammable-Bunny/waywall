@@ -25,6 +25,9 @@ static const struct config defaults = {
             .debug = false,
             .jit = false,
             .tearing = false,
+            .no_dmabuf = false,
+            .force_composition = false,
+            .subprocess_dri_prime = NULL,
         },
     .input =
         {
@@ -474,6 +477,18 @@ process_config_experimental(struct config *cfg) {
     }
 
     if (get_bool(cfg, "tearing", &cfg->experimental.tearing, "experimental.tearing", false) != 0) {
+        return 1;
+    }
+
+    if (get_bool(cfg, "no_dmabuf", &cfg->experimental.no_dmabuf, "experimental.no_dmabuf", false) != 0) {
+        return 1;
+    }
+
+    if (get_bool(cfg, "force_composition", &cfg->experimental.force_composition, "experimental.force_composition", false) != 0) {
+        return 1;
+    }
+
+    if (get_string(cfg, "subprocess_dri_prime", &cfg->experimental.subprocess_dri_prime, "experimental.subprocess_dri_prime", false) != 0) {
         return 1;
     }
 

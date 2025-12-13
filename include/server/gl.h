@@ -9,6 +9,8 @@
 #include <stdbool.h>
 #include <wayland-server-core.h>
 
+struct gbm_device;
+
 #define server_gl_with(gl, surface)                                                                \
     for (int _glscope = (server_gl_enter((gl), (surface)), 0); _glscope == 0;                      \
          _glscope = (server_gl_exit((gl)), 1))
@@ -57,6 +59,9 @@ struct server_gl {
     struct {
         struct wl_signal frame; // data: NULL
     } events;
+
+    int drm_fd;
+    struct gbm_device *gbm;
 };
 
 struct server_gl_shader {

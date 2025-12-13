@@ -42,6 +42,7 @@ struct server_linux_buffer_params {
 struct server_linux_dmabuf_feedback {
     struct wl_resource *resource;
 
+    struct server_linux_dmabuf *parent;
     struct zwp_linux_dmabuf_feedback_v1 *remote;
 };
 

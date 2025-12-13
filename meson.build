@@ -46,6 +46,7 @@ glesv2 = dependency('glesv2')
 spng = dependency('spng')
 avif = dependency('libavif')
 wayland_egl = dependency('wayland-egl')
+gbm = dependency('gbm')
 
 xcb = dependency('xcb')
 xcb_composite = dependency('xcb-composite')
@@ -70,6 +71,7 @@ waywall_deps = [
   spng,
   avif,
   wayland_egl,
+  gbm,
 
   xcb,
   xcb_composite,

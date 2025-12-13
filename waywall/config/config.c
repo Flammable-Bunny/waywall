@@ -26,7 +26,7 @@ static const struct config defaults = {
             .jit = false,
             .tearing = false,
             .no_dmabuf = false,
-            .force_composition = false,
+            .force_composition = true,
             .subprocess_dri_prime = NULL,
         },
     .input =

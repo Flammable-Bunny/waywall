@@ -959,7 +959,7 @@ draw_stencil(struct scene *scene) {
     gl_using_buffer(GL_ARRAY_BUFFER, scene->buffers.stencil_rect) {
         gl_using_texture(GL_TEXTURE_2D, tex) {
             glBufferData(GL_ARRAY_BUFFER, sizeof(buf), buf, GL_STATIC_DRAW);
-            server_gl_shader_use(scene->shaders.data[0].shader);
+    server_gl_shader_use(scene->shaders.data[0].shader);
             draw_vertex_list(&scene->shaders.data[0], 6);
         }
     }

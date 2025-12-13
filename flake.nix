@@ -36,6 +36,7 @@
           # EGL/GL
           libGL
           mesa
+          libgbm
           # XCB dependencies
           xorg.libxcb
           xorg.xcbutilwm
@@ -47,6 +48,11 @@
           curl
           libircclient
         ];
+
+        shellHook = ''
+          export PKG_CONFIG_PATH=${pkgs.libgbm}/lib/pkgconfig:$PKG_CONFIG_PATH
+          export INTEL_DEBUG=noccs
+        '';
 
         installPhase = ''
           runHook preInstall

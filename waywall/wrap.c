@@ -387,9 +387,7 @@ on_view_create(struct wl_listener *listener, void *data) {
         wl_subsurface_place_below(wrap->view->subsurface, wrap->view->ui->tree.surface);
     }
 
-    server_gl_set_capture(wrap->gl, view->surface);
-
-    // Also set capture on Vulkan backend for cross-GPU rendering
+    // Set capture on Vulkan backend for cross-GPU game rendering
     if (wrap->vk) {
         server_vk_set_capture(wrap->vk, view->surface);
     }
@@ -547,25 +545,17 @@ wrap_create(struct server *server, struct inotify *inotify, struct ww_timer *tim
             struct config *cfg) {
     struct wrap *wrap = zalloc(1, sizeof(*wrap));
 
-    wrap->gl = server_gl_create(server);
-    if (!wrap->gl) {
-        ww_log(LOG_ERROR, "failed to initialize OpenGL");
+    // Vulkan-only mode for cross-GPU rendering (handles game + overlays)
+    wrap->vk = server_vk_create(server);
+    if (!wrap->vk) {
+        ww_log(LOG_ERROR, "failed to initialize Vulkan backend");
         goto fail_gl;
     }
+    ww_log(LOG_INFO, "Vulkan backend initialized for cross-GPU rendering");
 
-    // Create Vulkan backend for cross-GPU sync (optional, continues without it)
-    wrap->vk = server_vk_create(server, cfg->experimental.dual_gpu);
-    if (wrap->vk) {
-        ww_log(LOG_INFO, "Vulkan backend initialized for cross-GPU sync");
-    } else {
-        ww_log(LOG_WARN, "Vulkan backend not available, using GL only");
-    }
-
-    wrap->scene = scene_create(cfg, wrap->gl, server->ui);
-    if (!wrap->scene) {
-        ww_log(LOG_ERROR, "failed to create scene");
-        goto fail_scene;
-    }
+    // GL/scene disabled - Vulkan handles everything for better performance
+    wrap->gl = NULL;
+    wrap->scene = NULL;
 
     wrap->cfg = cfg;
     wrap->server = server;
@@ -599,15 +589,11 @@ wrap_create(struct server *server, struct inotify *inotify, struct ww_timer *tim
 
     return wrap;
 
-fail_scene:
+fail_gl:
     if (wrap->vk) {
         server_vk_destroy(wrap->vk);
     }
-    server_gl_destroy(wrap->gl);
-
-fail_gl:
     free(wrap);
-
     return NULL;
 }
 
@@ -617,11 +603,15 @@ wrap_destroy(struct wrap *wrap) {
         instance_destroy(wrap->instance);
     }
 
-    scene_destroy(wrap->scene);
+    if (wrap->scene) {
+        scene_destroy(wrap->scene);
+    }
     if (wrap->vk) {
         server_vk_destroy(wrap->vk);
     }
-    server_gl_destroy(wrap->gl);
+    if (wrap->gl) {
+        server_gl_destroy(wrap->gl);
+    }
 
     subproc_destroy(wrap->subproc);
 

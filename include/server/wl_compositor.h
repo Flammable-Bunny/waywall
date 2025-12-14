@@ -6,6 +6,8 @@
 #include <wayland-server-core.h>
 #include <wayland-util.h>
 
+struct server_drm_syncobj_surface;
+
 struct server_compositor {
     struct wl_global *global;
 
@@ -50,6 +52,10 @@ struct server_surface {
         struct wl_signal commit;  // data: struct server_surface *
         struct wl_signal destroy; // data: struct server_surface *
     } events;
+
+    struct wl_list frame_callbacks;
+
+    struct server_drm_syncobj_surface *syncobj;
 };
 
 struct server_surface_role {
@@ -67,5 +73,6 @@ struct server_surface *server_surface_try_from_resource(struct wl_resource *reso
 struct server_buffer *server_surface_next_buffer(struct server_surface *surface);
 int server_surface_set_role(struct server_surface *surface, const struct server_surface_role *role,
                             struct wl_resource *role_resource);
+void server_surface_send_frame_done(struct server_surface *surface, uint32_t time);
 
 #endif

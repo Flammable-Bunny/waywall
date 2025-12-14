@@ -20,6 +20,8 @@ shader_sources = [
   'blit.vert',
   'blit.frag',
   'blit_buffer.frag',
+  'mirror.frag',
+  'image.frag',
 ]
 
 spirv_shaders = []

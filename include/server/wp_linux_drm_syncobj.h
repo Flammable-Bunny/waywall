@@ -3,6 +3,7 @@
 
 #include "server/server.h"
 #include <stdint.h>
+#include <vulkan/vulkan.h>
 #include <wayland-server-core.h>
 #include <wayland-util.h>
 
@@ -21,6 +22,12 @@ struct server_drm_syncobj_surface {
 
     struct server_surface *parent;
     struct wp_linux_drm_syncobj_surface_v1 *remote;
+
+    VkSemaphore vk_sem;
+    int imported_fd;
+
+    VkSemaphore vk_sem_release;
+    int imported_release_fd;
 
     struct wl_listener on_surface_destroy;
 

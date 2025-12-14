@@ -43,6 +43,10 @@ static void
 drm_syncobj_surface_resource_destroy(struct wl_resource *resource) {
     struct server_drm_syncobj_surface *syncobj_surface = wl_resource_get_user_data(resource);
 
+    if (syncobj_surface->parent) {
+        syncobj_surface->parent->syncobj = NULL;
+    }
+
     if (syncobj_surface->acquire.fd != -1) {
         close(syncobj_surface->acquire.fd);
     }
@@ -187,6 +191,7 @@ drm_syncobj_manager_get_surface(struct wl_client *client, struct wl_resource *re
     syncobj_surface->resource = syncobj_surface_resource;
     syncobj_surface->manager = syncobj_manager;
     syncobj_surface->parent = surface;
+    surface->syncobj = syncobj_surface; // Link
 
     syncobj_surface->remote =
         wp_linux_drm_syncobj_manager_v1_get_surface(syncobj_manager->remote, surface->remote);

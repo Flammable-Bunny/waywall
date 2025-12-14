@@ -78,6 +78,7 @@ struct scene {
     struct server_ui *ui;
 
     bool force_composition; // Draw capture as background (for cross-GPU support)
+    bool vk_active;         // Vulkan backend is handling game rendering (skip game background)
 
     uint32_t image_max_size;
 
@@ -184,6 +185,7 @@ struct animation_manager;
 
 struct scene *scene_create(struct config *cfg, struct server_gl *gl, struct server_ui *ui);
 void scene_destroy(struct scene *scene);
+void scene_set_vk_active(struct scene *scene, bool active);
 
 struct scene_image *scene_add_image(struct scene *scene, const struct scene_image_options *options,
                                     const char *path);

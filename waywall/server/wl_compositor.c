@@ -19,29 +19,27 @@ struct server_surface_damage {
 
 struct server_surface_frame {
     struct wl_resource *resource; // wl_callback
+    struct wl_list link;
 
     struct server_surface *surface;
-    struct wl_callback *remote;
 };
 
 static void
 surface_frame_resource_destroy(struct wl_resource *resource) {
     struct server_surface_frame *frame = wl_resource_get_user_data(resource);
 
-    wl_callback_destroy(frame->remote);
+    wl_list_remove(&frame->link);
     free(frame);
 }
 
-static void
-on_surface_frame_done(void *data, struct wl_callback *wl, uint32_t callback_data) {
-    struct server_surface_frame *frame = data;
-
-    wl_callback_send_done(frame->resource, callback_data);
+void
+server_surface_send_frame_done(struct server_surface *surface, uint32_t time) {
+    struct server_surface_frame *frame, *tmp;
+    wl_list_for_each_safe(frame, tmp, &surface->frame_callbacks, link) {
+        wl_callback_send_done(frame->resource, time);
+        wl_resource_destroy(frame->resource);
+    }
 }
-
-static const struct wl_callback_listener surface_frame_listener = {
-    .done = on_surface_frame_done,
-};
 
 static void
 surface_state_reset(struct server_surface_state *state) {
@@ -91,6 +89,22 @@ static const struct wl_region_interface region_impl = {
 static void
 surface_resource_destroy(struct wl_resource *resource) {
     struct server_surface *surface = wl_resource_get_user_data(resource);
+
+    struct server_surface_frame *frame, *tmp;
+    wl_list_for_each_safe(frame, tmp, &surface->frame_callbacks, link) {
+        wl_resource_destroy(frame->resource);
+    }
+
+    // Since struct server_drm_syncobj_surface is destroyed via resource destruction, we don't manually free it here.
+    // BUT we should ensure we don't leak the semaphores if the protocol object outlives the surface or vice versa?
+    // Actually, `drm_syncobj_surface_resource_destroy` does the cleanup.
+    // However, the `vk_sem` and `vk_sem_release` are Vulkan objects. They need to be destroyed with `vkDestroySemaphore`.
+    // But `wl_compositor.c` doesn't know about Vulkan device!
+    // The semaphores are stored in `server_drm_syncobj_surface`.
+    // We need to clean them up in `waywall/server/wp_linux_drm_syncobj.c` -> `drm_syncobj_surface_resource_destroy`.
+    
+    // I am in `wl_compositor.c`. I should not touch vk objects here.
+    // I will skip editing this file and edit `waywall/server/wp_linux_drm_syncobj.c` instead.
 
     wl_signal_emit_mutable(&surface->events.destroy, surface);
 
@@ -235,9 +249,8 @@ surface_frame(struct wl_client *client, struct wl_resource *resource, uint32_t i
     check_alloc(frame->resource);
     wl_resource_set_implementation(frame->resource, NULL, frame, surface_frame_resource_destroy);
 
-    frame->remote = wl_surface_frame(surface->remote);
-    check_alloc(frame->remote);
-    wl_callback_add_listener(frame->remote, &surface_frame_listener, frame);
+    frame->surface = surface;
+    wl_list_insert(&surface->frame_callbacks, &frame->link);
 }
 
 static void
@@ -344,6 +357,7 @@ compositor_create_surface(struct wl_client *client, struct wl_resource *resource
 
     surface->parent = compositor;
 
+    wl_list_init(&surface->frame_callbacks);
     wl_signal_init(&surface->events.commit);
     wl_signal_init(&surface->events.destroy);
 

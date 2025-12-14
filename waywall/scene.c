@@ -1077,9 +1077,17 @@ draw_frame(struct scene *scene) {
     struct scene_object *object;
     struct wl_list *positive_depth = NULL;
 
-    // In force_composition mode, draw the capture directly as background.
-    // Skip stencil masking since we're drawing the game ourselves and overlays go on top.
-    if (scene->force_composition) {
+    // When Vulkan is active, it handles game rendering on a separate surface.
+    // We just draw overlays on a transparent background (no game background, no stencil).
+    if (scene->vk_active) {
+        // Draw all scene objects on transparent background (Vulkan surface is below)
+        wl_list_for_each (object, &scene->objects.sorted, link) {
+            if (object->enabled)
+                object_render(object);
+        }
+    } else if (scene->force_composition) {
+        // In force_composition mode, draw the capture directly as background.
+        // Skip stencil masking since we're drawing the game ourselves and overlays go on top.
         draw_capture_background(scene);
 
         // Draw all scene objects on top of the game (no stencil test needed)
@@ -1394,6 +1402,11 @@ scene_destroy(struct scene *scene) {
     }
 
     free(scene);
+}
+
+void
+scene_set_vk_active(struct scene *scene, bool active) {
+    scene->vk_active = active;
 }
 
 struct scene_image *

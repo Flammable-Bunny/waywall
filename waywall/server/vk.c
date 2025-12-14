@@ -1,15 +1,21 @@
 #define _GNU_SOURCE
 
 #include "server/vk.h"
+#include "config/config.h"
 #include "server/backend.h"
 #include "server/buffer.h"
 #include "server/server.h"
 #include "server/ui.h"
 #include "server/wl_compositor.h"
+#include "server/wp_linux_drm_syncobj.h"
 #include "server/wp_linux_dmabuf.h"
 #include "util/alloc.h"
 #include "util/log.h"
+#include "util/png.h"
 #include "util/prelude.h"
+
+#include <ft2build.h>
+#include FT_FREETYPE_H
 
 #include <errno.h>
 #include <fcntl.h>
@@ -17,10 +23,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <vulkan/vulkan.h>
 #include <vulkan/vulkan_wayland.h>
+
+static PFN_vkImportSemaphoreFdKHR pfn_vkImportSemaphoreFdKHR = NULL;
 
 #include <wayland-client-protocol.h>
 
@@ -47,6 +56,7 @@ static const char *DEVICE_EXTENSIONS[] = {
     VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
     VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME,
     VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME,
+    VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME,
     VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
     VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME,
     VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME,  // For cross-GPU queue family transfers
@@ -211,7 +221,18 @@ select_physical_device(struct server_vk *vk) {
     VkPhysicalDevice selected = VK_NULL_HANDLE;
     VkPhysicalDevice fallback = VK_NULL_HANDLE;
 
+    bool has_amd = false;
+    bool has_intel = false;
+
     for (uint32_t i = 0; i < count; i++) {
+        VkPhysicalDeviceProperties props;
+        vkGetPhysicalDeviceProperties(devices[i], &props);
+
+        vk_log(LOG_INFO, "Device found: %s (vendor=0x%x)", props.deviceName, props.vendorID);
+
+        if (props.vendorID == 0x1002) has_amd = true;
+        if (props.vendorID == 0x8086) has_intel = true;
+
         if (!check_device_extensions(devices[i])) {
             continue;
         }
@@ -221,16 +242,13 @@ select_physical_device(struct server_vk *vk) {
             continue;
         }
 
-        VkPhysicalDeviceProperties props;
-        vkGetPhysicalDeviceProperties(devices[i], &props);
-
         vk_log(LOG_INFO, "found suitable device: %s", props.deviceName);
 
         if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
             selected = devices[i];
             vk->graphics_family = gfx_family;
             vk->present_family = present_family;
-            break;
+            // break; // Don't break early so we can detect all vendors
         } else if (fallback == VK_NULL_HANDLE) {
             fallback = devices[i];
             vk->graphics_family = gfx_family;
@@ -244,16 +262,19 @@ select_physical_device(struct server_vk *vk) {
 
     free(devices);
 
+    vk_log(LOG_INFO, "Detection result: has_amd=%d, has_intel=%d", has_amd, has_intel);
+
     if (selected == VK_NULL_HANDLE) {
         vk_log(LOG_ERROR, "no suitable Vulkan device found");
         return false;
     }
 
     vk->physical_device = selected;
+    vk->dual_gpu = has_amd && has_intel;
 
     VkPhysicalDeviceProperties props;
     vkGetPhysicalDeviceProperties(selected, &props);
-    vk_log(LOG_INFO, "selected device: %s", props.deviceName);
+    vk_log(LOG_INFO, "selected device: %s (dual_gpu=%s)", props.deviceName, vk->dual_gpu ? "true" : "false");
 
     vkGetPhysicalDeviceMemoryProperties(selected, &vk->memory_properties);
 
@@ -283,8 +304,14 @@ create_device(struct server_vk *vk) {
 
     VkPhysicalDeviceFeatures features = {0};
 
+    VkPhysicalDeviceTimelineSemaphoreFeatures timeline_features = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES,
+        .timelineSemaphore = VK_TRUE,
+    };
+
     VkDeviceCreateInfo create_info = {
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+        .pNext = &timeline_features,
         .queueCreateInfoCount = unique_count,
         .pQueueCreateInfos = queue_infos,
         .enabledExtensionCount = ARRAY_LEN(DEVICE_EXTENSIONS),
@@ -297,6 +324,11 @@ create_device(struct server_vk *vk) {
 
     vkGetDeviceQueue(vk->device, vk->graphics_family, 0, &vk->graphics_queue);
     vkGetDeviceQueue(vk->device, vk->present_family, 0, &vk->present_queue);
+
+    pfn_vkImportSemaphoreFdKHR = (PFN_vkImportSemaphoreFdKHR)vkGetDeviceProcAddr(vk->device, "vkImportSemaphoreFdKHR");
+    if (!pfn_vkImportSemaphoreFdKHR) {
+        vk_log(LOG_WARN, "failed to load vkImportSemaphoreFdKHR - explicit sync disabled");
+    }
 
     vk_log(LOG_INFO, "created logical device");
     return true;
@@ -314,15 +346,15 @@ choose_surface_format(VkPhysicalDevice device, VkSurfaceKHR surface) {
     VkSurfaceFormatKHR *formats = zalloc(count, sizeof(*formats));
     vkGetPhysicalDeviceSurfaceFormatsKHR(device, surface, &count, formats);
 
-    // Prefer BGRA8 SRGB
+    // Prefer BGRA8 UNORM (pass-through sRGB values without re-encoding)
     VkSurfaceFormatKHR selected = formats[0];
     for (uint32_t i = 0; i < count; i++) {
-        if (formats[i].format == VK_FORMAT_B8G8R8A8_SRGB &&
+        if (formats[i].format == VK_FORMAT_B8G8R8A8_UNORM &&
             formats[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
             selected = formats[i];
             break;
         }
-        if (formats[i].format == VK_FORMAT_B8G8R8A8_UNORM) {
+        if (formats[i].format == VK_FORMAT_B8G8R8A8_SRGB) {
             selected = formats[i];
         }
     }
@@ -359,10 +391,11 @@ choose_present_mode(VkPhysicalDevice device, VkSurfaceKHR surface) {
 }
 
 static bool
-create_swapchain(struct server_vk *vk, uint32_t width, uint32_t height) {
+create_swapchain(struct server_vk *vk, uint32_t width, uint32_t height, VkSwapchainKHR old_swapchain) {
     VkSurfaceCapabilitiesKHR caps;
     vkGetPhysicalDeviceSurfaceCapabilitiesKHR(vk->physical_device, vk->swapchain.surface, &caps);
 
+    // Prefer BGRA8 UNORM (pass-through sRGB values without re-encoding)
     VkSurfaceFormatKHR format = choose_surface_format(vk->physical_device, vk->swapchain.surface);
     VkPresentModeKHR present_mode = choose_present_mode(vk->physical_device, vk->swapchain.surface);
 
@@ -398,7 +431,7 @@ create_swapchain(struct server_vk *vk, uint32_t width, uint32_t height) {
         .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
         .presentMode = present_mode,
         .clipped = VK_TRUE,
-        .oldSwapchain = VK_NULL_HANDLE,
+        .oldSwapchain = old_swapchain,
     };
 
     uint32_t queue_families[] = { vk->graphics_family, vk->present_family };
@@ -1390,6 +1423,302 @@ create_buffer_blit_pipeline(struct server_vk *vk) {
     return true;
 }
 
+// Mirror push constants structure (must match shader)
+struct mirror_push_constants {
+    int32_t game_width;
+    int32_t game_height;
+    int32_t game_stride;
+    int32_t src_x;
+    int32_t src_y;
+    int32_t src_w;
+    int32_t src_h;
+    int32_t color_key_enabled;
+    float key_r, key_g, key_b;
+    float out_r, out_g, out_b;
+    float tolerance;
+};
+
+static bool
+create_mirror_pipeline(struct server_vk *vk) {
+    // Create shader module for mirror fragment shader
+    vk->mirror_pipeline.frag = create_shader_module(vk->device, mirror_frag_spv, mirror_frag_spv_size);
+    if (!vk->mirror_pipeline.frag) {
+        vk_log(LOG_ERROR, "failed to create mirror shader module");
+        return false;
+    }
+
+    // Push constants for mirror parameters
+    VkPushConstantRange push_range = {
+        .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+        .offset = 0,
+        .size = sizeof(struct mirror_push_constants),
+    };
+
+    VkPipelineLayoutCreateInfo pipeline_layout_ci = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 1,
+        .pSetLayouts = &vk->buffer_blit.descriptor_layout,  // Reuse storage buffer layout
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &push_range,
+    };
+
+    if (vkCreatePipelineLayout(vk->device, &pipeline_layout_ci, NULL, &vk->mirror_pipeline.layout) != VK_SUCCESS) {
+        vk_log(LOG_ERROR, "failed to create mirror pipeline layout");
+        return false;
+    }
+
+    // Create graphics pipeline (reuse vertex shader from blit)
+    VkPipelineShaderStageCreateInfo shader_stages[] = {
+        {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .stage = VK_SHADER_STAGE_VERTEX_BIT,
+            .module = vk->blit_pipeline.vert,
+            .pName = "main",
+        },
+        {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+            .module = vk->mirror_pipeline.frag,
+            .pName = "main",
+        },
+    };
+
+    VkVertexInputBindingDescription binding = {
+        .binding = 0,
+        .stride = sizeof(struct quad_vertex),
+        .inputRate = VK_VERTEX_INPUT_RATE_VERTEX,
+    };
+
+    VkVertexInputAttributeDescription attributes[] = {
+        { .location = 0, .binding = 0, .format = VK_FORMAT_R32G32_SFLOAT, .offset = 0 },
+        { .location = 1, .binding = 0, .format = VK_FORMAT_R32G32_SFLOAT, .offset = sizeof(float) * 2 },
+    };
+
+    VkPipelineVertexInputStateCreateInfo vertex_input = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+        .vertexBindingDescriptionCount = 1,
+        .pVertexBindingDescriptions = &binding,
+        .vertexAttributeDescriptionCount = ARRAY_LEN(attributes),
+        .pVertexAttributeDescriptions = attributes,
+    };
+
+    VkPipelineInputAssemblyStateCreateInfo input_assembly = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+        .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+    };
+
+    VkDynamicState dynamic_states[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    VkPipelineDynamicStateCreateInfo dynamic_state = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+        .dynamicStateCount = ARRAY_LEN(dynamic_states),
+        .pDynamicStates = dynamic_states,
+    };
+
+    VkPipelineViewportStateCreateInfo viewport_state = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+        .viewportCount = 1,
+        .scissorCount = 1,
+    };
+
+    VkPipelineRasterizationStateCreateInfo rasterization = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+        .polygonMode = VK_POLYGON_MODE_FILL,
+        .lineWidth = 1.0f,
+        .cullMode = VK_CULL_MODE_NONE,
+        .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE,
+    };
+
+    VkPipelineMultisampleStateCreateInfo multisampling = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+        .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
+    };
+
+    // Enable alpha blending for mirrors
+    VkPipelineColorBlendAttachmentState blend_attachment = {
+        .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                          VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
+        .blendEnable = VK_TRUE,
+        .srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA,
+        .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+        .colorBlendOp = VK_BLEND_OP_ADD,
+        .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
+        .dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO,
+        .alphaBlendOp = VK_BLEND_OP_ADD,
+    };
+
+    VkPipelineColorBlendStateCreateInfo color_blending = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+        .attachmentCount = 1,
+        .pAttachments = &blend_attachment,
+    };
+
+    VkGraphicsPipelineCreateInfo pipeline_ci = {
+        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+        .stageCount = ARRAY_LEN(shader_stages),
+        .pStages = shader_stages,
+        .pVertexInputState = &vertex_input,
+        .pInputAssemblyState = &input_assembly,
+        .pViewportState = &viewport_state,
+        .pRasterizationState = &rasterization,
+        .pMultisampleState = &multisampling,
+        .pColorBlendState = &color_blending,
+        .pDynamicState = &dynamic_state,
+        .layout = vk->mirror_pipeline.layout,
+        .renderPass = vk->render_pass,
+        .subpass = 0,
+    };
+
+    if (vkCreateGraphicsPipelines(vk->device, VK_NULL_HANDLE, 1, &pipeline_ci, NULL, &vk->mirror_pipeline.pipeline) != VK_SUCCESS) {
+        vk_log(LOG_ERROR, "failed to create mirror pipeline");
+        return false;
+    }
+
+    vk_log(LOG_INFO, "created mirror pipeline");
+    return true;
+}
+
+static bool
+create_image_pipeline(struct server_vk *vk) {
+    // Create descriptor set layout for images (same as blit - combined image sampler)
+    if (!create_descriptor_set_layout(vk, &vk->image_pipeline.descriptor_layout)) {
+        vk_log(LOG_ERROR, "failed to create image descriptor set layout");
+        return false;
+    }
+
+    // Pipeline layout (no push constants needed - viewport controls position)
+    VkPipelineLayoutCreateInfo layout_info = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 1,
+        .pSetLayouts = &vk->image_pipeline.descriptor_layout,
+    };
+
+    if (vkCreatePipelineLayout(vk->device, &layout_info, NULL, &vk->image_pipeline.layout) != VK_SUCCESS) {
+        vk_log(LOG_ERROR, "failed to create image pipeline layout");
+        return false;
+    }
+
+    // Create shader module for image fragment shader
+    VkShaderModule image_frag = create_shader_module(vk->device, image_frag_spv, image_frag_spv_size);
+    if (!image_frag) {
+        vk_log(LOG_ERROR, "failed to create image shader module");
+        return false;
+    }
+
+    // Shader stages (reuse vertex shader from blit)
+    VkPipelineShaderStageCreateInfo shader_stages[] = {
+        {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .stage = VK_SHADER_STAGE_VERTEX_BIT,
+            .module = vk->blit_pipeline.vert,
+            .pName = "main",
+        },
+        {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+            .module = image_frag,
+            .pName = "main",
+        },
+    };
+
+    VkVertexInputBindingDescription binding = {
+        .binding = 0,
+        .stride = sizeof(struct quad_vertex),
+        .inputRate = VK_VERTEX_INPUT_RATE_VERTEX,
+    };
+
+    VkVertexInputAttributeDescription attributes[] = {
+        { .location = 0, .binding = 0, .format = VK_FORMAT_R32G32_SFLOAT, .offset = 0 },
+        { .location = 1, .binding = 0, .format = VK_FORMAT_R32G32_SFLOAT, .offset = sizeof(float) * 2 },
+    };
+
+    VkPipelineVertexInputStateCreateInfo vertex_input = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+        .vertexBindingDescriptionCount = 1,
+        .pVertexBindingDescriptions = &binding,
+        .vertexAttributeDescriptionCount = ARRAY_LEN(attributes),
+        .pVertexAttributeDescriptions = attributes,
+    };
+
+    VkPipelineInputAssemblyStateCreateInfo input_assembly = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+        .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+    };
+
+    VkDynamicState dynamic_states[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    VkPipelineDynamicStateCreateInfo dynamic_state = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+        .dynamicStateCount = ARRAY_LEN(dynamic_states),
+        .pDynamicStates = dynamic_states,
+    };
+
+    VkPipelineViewportStateCreateInfo viewport_state = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+        .viewportCount = 1,
+        .scissorCount = 1,
+    };
+
+    VkPipelineRasterizationStateCreateInfo rasterization = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+        .polygonMode = VK_POLYGON_MODE_FILL,
+        .lineWidth = 1.0f,
+        .cullMode = VK_CULL_MODE_NONE,
+        .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE,
+    };
+
+    VkPipelineMultisampleStateCreateInfo multisampling = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+        .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
+    };
+
+    // Enable alpha blending for images with transparency
+    VkPipelineColorBlendAttachmentState blend_attachment = {
+        .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                          VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
+        .blendEnable = VK_TRUE,
+        .srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA,
+        .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+        .colorBlendOp = VK_BLEND_OP_ADD,
+        .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
+        .dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO,
+        .alphaBlendOp = VK_BLEND_OP_ADD,
+    };
+
+    VkPipelineColorBlendStateCreateInfo color_blending = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+        .attachmentCount = 1,
+        .pAttachments = &blend_attachment,
+    };
+
+    VkGraphicsPipelineCreateInfo pipeline_ci = {
+        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+        .stageCount = ARRAY_LEN(shader_stages),
+        .pStages = shader_stages,
+        .pVertexInputState = &vertex_input,
+        .pInputAssemblyState = &input_assembly,
+        .pViewportState = &viewport_state,
+        .pRasterizationState = &rasterization,
+        .pMultisampleState = &multisampling,
+        .pColorBlendState = &color_blending,
+        .pDynamicState = &dynamic_state,
+        .layout = vk->image_pipeline.layout,
+        .renderPass = vk->render_pass,
+        .subpass = 0,
+    };
+
+    VkResult result = vkCreateGraphicsPipelines(vk->device, VK_NULL_HANDLE, 1, &pipeline_ci, NULL, &vk->image_pipeline.pipeline);
+
+    // Clean up shader module (don't need to keep it)
+    vkDestroyShaderModule(vk->device, image_frag, NULL);
+
+    if (result != VK_SUCCESS) {
+        vk_log(LOG_ERROR, "failed to create image pipeline: %d", result);
+        return false;
+    }
+
+    vk_log(LOG_INFO, "created image pipeline");
+    return true;
+}
+
 static void
 destroy_pipeline(struct server_vk *vk, struct vk_pipeline *pipeline) {
     if (pipeline->pipeline) {
@@ -1410,15 +1739,17 @@ destroy_pipeline(struct server_vk *vk, struct vk_pipeline *pipeline) {
 // ============================================================================
 
 struct server_vk *
-server_vk_create(struct server *server, bool dual_gpu) {
+server_vk_create(struct server *server) {
     struct server_vk *vk = zalloc(1, sizeof(*vk));
     vk->server = server;
-    vk->dual_gpu = dual_gpu;
     vk->drm_fd = -1;
 
-    vk_log(LOG_INFO, "creating Vulkan backend (dual_gpu=%s)", dual_gpu ? "true" : "false");
+    vk_log(LOG_INFO, "creating Vulkan backend");
 
     wl_list_init(&vk->capture.buffers);
+    wl_list_init(&vk->mirrors);
+    wl_list_init(&vk->images);
+    wl_list_init(&vk->texts);
     wl_signal_init(&vk->events.frame);
     wl_list_init(&vk->on_ui_resize.link);
 
@@ -1469,7 +1800,7 @@ server_vk_create(struct server *server, bool dual_gpu) {
     // Create swapchain with initial size
     uint32_t width = server->ui ? server->ui->width : 640;
     uint32_t height = server->ui ? server->ui->height : 480;
-    if (!create_swapchain(vk, width, height)) {
+    if (!create_swapchain(vk, width, height, VK_NULL_HANDLE)) {
         goto fail;
     }
 
@@ -1489,8 +1820,20 @@ server_vk_create(struct server *server, bool dual_gpu) {
     }
 
     // Create pipelines
-    if (!create_texcopy_pipeline(vk) || !create_text_pipeline(vk) || !create_blit_pipeline(vk) || !create_buffer_blit_pipeline(vk)) {
+    if (!create_texcopy_pipeline(vk) || !create_text_pipeline(vk) || !create_blit_pipeline(vk) || !create_buffer_blit_pipeline(vk) || !create_mirror_pipeline(vk) || !create_image_pipeline(vk) || !create_text_vk_pipeline(vk)) {
         goto fail;
+    }
+
+    // Initialize font system for text rendering
+    struct config *cfg = server->config;
+    const char *font_path = cfg->theme.font_path;
+    uint32_t font_size = cfg->theme.font_size > 0 ? cfg->theme.font_size : 16;
+    if (font_path && font_path[0]) {
+        if (!init_font_system(vk, font_path, font_size)) {
+            vk_log(LOG_WARN, "font system initialization failed, text rendering disabled");
+        }
+    } else {
+        vk_log(LOG_INFO, "no font path configured, text rendering disabled");
     }
 
     // Create fullscreen quad vertex buffer
@@ -1535,6 +1878,21 @@ server_vk_destroy(struct server_vk *vk) {
     wl_list_for_each_safe(buf, tmp, &vk->capture.buffers, link) {
         vk_buffer_destroy(buf);
     }
+
+    // Destroy text objects
+    struct vk_text *text, *text_tmp;
+    wl_list_for_each_safe(text, text_tmp, &vk->texts, link) {
+        if (text->vertex_buffer) {
+            vkFreeMemory(vk->device, text->vertex_memory, NULL);
+            vkDestroyBuffer(vk->device, text->vertex_buffer, NULL);
+        }
+        wl_list_remove(&text->link);
+        free(text->text);
+        free(text);
+    }
+
+    // Destroy font system
+    destroy_font_system(vk);
 
     // Destroy sync objects
     for (int i = 0; i < VK_MAX_FRAMES_IN_FLIGHT; i++) {
@@ -1586,6 +1944,24 @@ server_vk_destroy(struct server_vk *vk) {
     }
     if (vk->buffer_blit.frag) {
         vkDestroyShaderModule(vk->device, vk->buffer_blit.frag, NULL);
+    }
+
+    // Destroy mirror pipeline
+    if (vk->mirror_pipeline.pipeline) {
+        vkDestroyPipeline(vk->device, vk->mirror_pipeline.pipeline, NULL);
+    }
+    if (vk->mirror_pipeline.layout) {
+        vkDestroyPipelineLayout(vk->device, vk->mirror_pipeline.layout, NULL);
+    }
+    if (vk->mirror_pipeline.frag) {
+        vkDestroyShaderModule(vk->device, vk->mirror_pipeline.frag, NULL);
+    }
+
+    // Destroy mirrors
+    struct vk_mirror *mirror, *tmp_mirror;
+    wl_list_for_each_safe(mirror, tmp_mirror, &vk->mirrors, link) {
+        wl_list_remove(&mirror->link);
+        free(mirror);
     }
 
     // Destroy shader modules and descriptor layouts
@@ -1715,27 +2091,6 @@ server_vk_get_capture_size(struct server_vk *vk, int32_t *width, int32_t *height
 // Cross-GPU DMA-BUF Synchronization
 // ============================================================================
 
-// Perform kernel-level dma-buf sync before accessing imported buffer
-static void
-dmabuf_sync_start_read(int fd) {
-    struct dma_buf_sync sync = {
-        .flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ,
-    };
-    if (ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync) < 0) {
-        vk_log(LOG_WARN, "DMA_BUF_SYNC_START failed: %s", strerror(errno));
-    }
-}
-
-static void
-dmabuf_sync_end_read(int fd) {
-    struct dma_buf_sync sync = {
-        .flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ,
-    };
-    if (ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync) < 0) {
-        vk_log(LOG_WARN, "DMA_BUF_SYNC_END failed: %s", strerror(errno));
-    }
-}
-
 // Transition imported image to shader-read layout with proper cross-GPU barrier
 static void
 transition_imported_image(struct server_vk *vk, VkImage image, VkCommandBuffer cmd) {
@@ -1846,113 +2201,90 @@ release_imported_buffer(struct server_vk *vk, VkBuffer buffer, VkCommandBuffer c
 // Frame Rendering
 // ============================================================================
 
-// Draw the captured texture as a fullscreen quad
+// Draw the captured texture centered in the window (matching original waywall behavior)
+// Called from begin_frame after validating capture is ready
 static void
 draw_captured_frame(struct server_vk *vk, VkCommandBuffer cmd) {
     struct vk_buffer *capture = vk->capture.current;
-    if (!capture) {
-        return;  // Nothing to draw
+    // Note: capture is validated in begin_frame, so we assert here
+    ww_assert(capture);
+
+    int32_t game_width = capture->width;
+    int32_t game_height = capture->height;
+    int32_t window_width = (int32_t)vk->swapchain.extent.width;
+    int32_t window_height = (int32_t)vk->swapchain.extent.height;
+
+    // Calculate centered position (same logic as layout_centered in ui.c)
+    int32_t x = (window_width / 2) - (game_width / 2);
+    int32_t y = (window_height / 2) - (game_height / 2);
+
+    // Calculate viewport dimensions (handle case where game is larger than window)
+    int32_t vp_x, vp_y, vp_width, vp_height;
+
+    if (x >= 0 && y >= 0) {
+        // Game fits entirely within window - center it
+        vp_x = x;
+        vp_y = y;
+        vp_width = game_width;
+        vp_height = game_height;
+    } else {
+        // Game is larger than window - fill entire window
+        // The game content will be cropped by the viewport
+        vp_x = (x < 0) ? 0 : x;
+        vp_y = (y < 0) ? 0 : y;
+        vp_width = (x < 0) ? window_width : game_width;
+        vp_height = (y < 0) ? window_height : game_height;
     }
 
-        // vk_log(LOG_INFO, "Drawing frame %d: %dx%d stride=%d", vk->current_frame, capture->width, capture->height, capture->stride);
+    // Set viewport to centered position
+    VkViewport viewport = {
+        .x = (float)vp_x,
+        .y = (float)vp_y,
+        .width = (float)vp_width,
+        .height = (float)vp_height,
+        .minDepth = 0.0f,
+        .maxDepth = 1.0f,
+    };
+    vkCmdSetViewport(cmd, 0, 1, &viewport);
 
-    
+    // Scissor clips to window bounds
+    VkRect2D scissor = {
+        .offset = { 0, 0 },
+        .extent = vk->swapchain.extent,
+    };
+    vkCmdSetScissor(cmd, 0, 1, &scissor);
 
-        // Set viewport and scissor to cover entire swapchain
+    // Bind the quad vertex buffer
+    VkDeviceSize offset = 0;
+    vkCmdBindVertexBuffers(cmd, 0, 1, &vk->quad_vertex_buffer, &offset);
 
-        VkViewport viewport = {
+    // Check if we should use the storage buffer path (NATIVE cross-GPU)
+    if (capture->storage_buffer && capture->buffer_descriptor_set) {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk->buffer_blit.pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                vk->buffer_blit.layout, 0, 1,
+                                &capture->buffer_descriptor_set, 0, NULL);
 
-            .x = 0.0f,
+        struct {
+            int32_t width;
+            int32_t height;
+            int32_t stride;
+            int32_t swap_colors;
+        } pc;
 
-            .y = 0.0f,
+        pc.width = capture->width;
+        pc.height = capture->height;
+        pc.stride = capture->stride;
+        // Buffer path reads raw memory (BGRX), so manual unpacking is consistent.
+        // No swap needed regardless of GPU combination.
+        pc.swap_colors = 0;
 
-            .width = (float)vk->swapchain.extent.width,
-
-            .height = (float)vk->swapchain.extent.height,
-
-            .minDepth = 0.0f,
-
-            .maxDepth = 1.0f,
-
-        };
-
-        vkCmdSetViewport(cmd, 0, 1, &viewport);
-
-    
-
-        VkRect2D scissor = {
-
-            .offset = { 0, 0 },
-
-            .extent = vk->swapchain.extent,
-
-        };
-
-        vkCmdSetScissor(cmd, 0, 1, &scissor);
-
-    
-
-        // Bind the quad vertex buffer
-
-        VkDeviceSize offset = 0;
-
-        vkCmdBindVertexBuffers(cmd, 0, 1, &vk->quad_vertex_buffer, &offset);
-
-    
-
-        // Check if we should use the storage buffer path (NATIVE cross-GPU)
-
-        if (capture->storage_buffer && capture->buffer_descriptor_set) {
-
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk->buffer_blit.pipeline);
-
-    
-
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-
-                                    vk->buffer_blit.layout, 0, 1,
-
-                                    &capture->buffer_descriptor_set, 0, NULL);
-
-    
-
-            struct {
-
-                int32_t width;
-
-                int32_t height;
-
-                int32_t stride;
-
-                int32_t swap_colors;
-
-            } pc;
-
-    
-
-            pc.width = capture->width;
-
-            pc.height = capture->height;
-
-            pc.stride = capture->stride;
-
-                    // Fix for "colors are reversed": Disable swap since XRGB matches output byte order
-
-                    pc.swap_colors = 1;
-
-            
-
-                    vkCmdPushConstants(cmd, vk->buffer_blit.layout, VK_SHADER_STAGE_FRAGMENT_BIT,
-
-                                       0, sizeof(pc), &pc);
-
-    
-
-            vkCmdDraw(cmd, 6, 1, 0, 0);
+        vkCmdPushConstants(cmd, vk->buffer_blit.layout, VK_SHADER_STAGE_FRAGMENT_BIT,
+                           0, sizeof(pc), &pc);
+        vkCmdDraw(cmd, 6, 1, 0, 0);
     } else if (capture->descriptor_set) {
         // Fallback to image path (Single GPU or compatible stride)
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk->blit_pipeline.pipeline);
-
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
                                 vk->blit_pipeline.layout, 0, 1,
                                 &capture->descriptor_set, 0, NULL);
@@ -1961,21 +2293,166 @@ draw_captured_frame(struct server_vk *vk, VkCommandBuffer cmd) {
         int32_t swap_colors = vk->dual_gpu ? 1 : 0;
         vkCmdPushConstants(cmd, vk->blit_pipeline.layout, VK_SHADER_STAGE_FRAGMENT_BIT,
                            0, sizeof(int32_t), &swap_colors);
+        vkCmdDraw(cmd, 6, 1, 0, 0);
+    }
+}
+
+// Draw all enabled mirrors
+static void
+draw_mirrors(struct server_vk *vk, VkCommandBuffer cmd) {
+    struct vk_buffer *capture = vk->capture.current;
+    if (!capture || !capture->storage_buffer || !capture->buffer_descriptor_set) {
+        return;  // Need storage buffer path for mirrors
+    }
+
+    if (wl_list_empty(&vk->mirrors)) {
+        return;  // No mirrors to draw
+    }
+
+    // Debug: log capture dimensions and mirror count (once per second)
+    static int frame_count = 0;
+    if (++frame_count % 60 == 0) {
+        int mirror_count = 0;
+        struct vk_mirror *m;
+        wl_list_for_each(m, &vk->mirrors, link) {
+            mirror_count++;
+        }
+        vk_log(LOG_INFO, "draw_mirrors: capture=%dx%d stride=%u, %d mirrors in list",
+               capture->width, capture->height, capture->stride, mirror_count);
+    }
+
+    // Bind mirror pipeline and descriptor set
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk->mirror_pipeline.pipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                            vk->mirror_pipeline.layout, 0, 1,
+                            &capture->buffer_descriptor_set, 0, NULL);
+
+    VkDeviceSize offset = 0;
+    vkCmdBindVertexBuffers(cmd, 0, 1, &vk->quad_vertex_buffer, &offset);
+
+    struct vk_mirror *mirror;
+    wl_list_for_each(mirror, &vk->mirrors, link) {
+        if (!mirror->enabled) {
+            continue;
+        }
+
+        // Set viewport for this mirror's destination
+        VkViewport viewport = {
+            .x = (float)mirror->dst.x,
+            .y = (float)mirror->dst.y,
+            .width = (float)mirror->dst.width,
+            .height = (float)mirror->dst.height,
+            .minDepth = 0.0f,
+            .maxDepth = 1.0f,
+        };
+        vkCmdSetViewport(cmd, 0, 1, &viewport);
+
+        // Scissor to window bounds
+        VkRect2D scissor = {
+            .offset = { 0, 0 },
+            .extent = vk->swapchain.extent,
+        };
+        vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+        // Prepare push constants
+        struct mirror_push_constants pc = {
+            .game_width = capture->width,
+            .game_height = capture->height,
+            .game_stride = capture->stride,
+            .src_x = mirror->src.x,
+            .src_y = mirror->src.y,
+            .src_w = mirror->src.width,
+            .src_h = mirror->src.height,
+            .color_key_enabled = mirror->color_key_enabled ? 1 : 0,
+            .key_r = ((mirror->color_key_input >> 16) & 0xFF) / 255.0f,
+            .key_g = ((mirror->color_key_input >> 8) & 0xFF) / 255.0f,
+            .key_b = (mirror->color_key_input & 0xFF) / 255.0f,
+            .out_r = ((mirror->color_key_output >> 16) & 0xFF) / 255.0f,
+            .out_g = ((mirror->color_key_output >> 8) & 0xFF) / 255.0f,
+            .out_b = (mirror->color_key_output & 0xFF) / 255.0f,
+            .tolerance = mirror->color_key_tolerance,
+        };
+
+        vkCmdPushConstants(cmd, vk->mirror_pipeline.layout, VK_SHADER_STAGE_FRAGMENT_BIT,
+                           0, sizeof(pc), &pc);
+        vkCmdDraw(cmd, 6, 1, 0, 0);
+    }
+}
+
+static void
+draw_images(struct server_vk *vk, VkCommandBuffer cmd) {
+    if (wl_list_empty(&vk->images)) {
+        return;  // No images to draw
+    }
+
+    // Bind image pipeline
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk->image_pipeline.pipeline);
+
+    VkDeviceSize offset = 0;
+    vkCmdBindVertexBuffers(cmd, 0, 1, &vk->quad_vertex_buffer, &offset);
+
+    struct vk_image *image;
+    wl_list_for_each(image, &vk->images, link) {
+        if (!image->enabled || image->descriptor_set == VK_NULL_HANDLE) {
+            continue;
+        }
+
+        // Bind this image's descriptor set
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                vk->image_pipeline.layout, 0, 1,
+                                &image->descriptor_set, 0, NULL);
+
+        // Set viewport for this image's destination
+        VkViewport viewport = {
+            .x = (float)image->dst.x,
+            .y = (float)image->dst.y,
+            .width = (float)image->dst.width,
+            .height = (float)image->dst.height,
+            .minDepth = 0.0f,
+            .maxDepth = 1.0f,
+        };
+        vkCmdSetViewport(cmd, 0, 1, &viewport);
+
+        // Scissor to window bounds
+        VkRect2D scissor = {
+            .offset = { 0, 0 },
+            .extent = vk->swapchain.extent,
+        };
+        vkCmdSetScissor(cmd, 0, 1, &scissor);
 
         vkCmdDraw(cmd, 6, 1, 0, 0);
     }
 }
 
-void
+bool
 server_vk_begin_frame(struct server_vk *vk) {
-    // Wait for previous frame to finish
-    vkWaitForFences(vk->device, 1, &vk->in_flight[vk->current_frame], VK_TRUE, UINT64_MAX);
-    vkResetFences(vk->device, 1, &vk->in_flight[vk->current_frame]);
+    // Check if we have valid capture data before proceeding
+    // This prevents presenting black frames when nothing can be drawn
+    struct vk_buffer *capture = vk->capture.current;
+    if (!capture) {
+        return false;  // Nothing to draw
+    }
+    bool has_buffer_path = capture->storage_buffer && capture->buffer_descriptor_set;
+    bool has_image_path = capture->descriptor_set != VK_NULL_HANDLE;
+    if (!has_buffer_path && !has_image_path) {
+        return false;  // No valid render path available
+    }
 
-    // Acquire next swapchain image
-    vkAcquireNextImageKHR(vk->device, vk->swapchain.swapchain, UINT64_MAX,
+    // Check if previous frame is finished (non-blocking)
+    if (vkGetFenceStatus(vk->device, vk->in_flight[vk->current_frame]) != VK_SUCCESS) {
+        return false; // Skip frame if GPU is busy
+    }
+    // vkResetFences moved to after acquire
+
+    // Acquire next swapchain image (non-blocking)
+    VkResult result = vkAcquireNextImageKHR(vk->device, vk->swapchain.swapchain, 0,
                           vk->image_available[vk->current_frame], VK_NULL_HANDLE,
                           &vk->current_image_index);
+    if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) {
+        return false;
+    }
+
+    vkResetFences(vk->device, 1, &vk->in_flight[vk->current_frame]);
 
     // Reset and begin command buffer
     VkCommandBuffer cmd = vk->command_buffers[vk->current_frame];
@@ -1989,7 +2466,7 @@ server_vk_begin_frame(struct server_vk *vk) {
     // Perform dma-buf sync and image/buffer transition for captured buffer
     if (vk->capture.current && vk->capture.current->dmabuf_fd >= 0) {
         // Kernel-level sync: wait for Intel GPU to finish writing
-        dmabuf_sync_start_read(vk->capture.current->dmabuf_fd);
+        // dmabuf_sync_start_read(vk->capture.current->dmabuf_fd);
 
         // GPU-level sync: transition from external GPU to our queue family
         if (vk->capture.current->storage_buffer && vk->capture.current->buffer_descriptor_set) {
@@ -2016,8 +2493,20 @@ server_vk_begin_frame(struct server_vk *vk) {
 
     vkCmdBeginRenderPass(cmd, &rp_info, VK_SUBPASS_CONTENTS_INLINE);
 
-    // Draw the captured frame as fullscreen quad
+    // Draw the captured frame centered in window
+    // Note: draw_captured_frame won't fail here since we validated capture in begin_frame
     draw_captured_frame(vk, cmd);
+
+    // Draw mirrors on top of the game
+    draw_mirrors(vk, cmd);
+
+    // Draw images on top of mirrors
+    draw_images(vk, cmd);
+
+    // Draw text on top of everything
+    draw_texts(vk, cmd);
+
+    return true;
 }
 
 void
@@ -2039,22 +2528,122 @@ server_vk_end_frame(struct server_vk *vk) {
 
     // End kernel-level dma-buf sync
     if (vk->capture.current && vk->capture.current->dmabuf_fd >= 0) {
-        dmabuf_sync_end_read(vk->capture.current->dmabuf_fd);
+        // dmabuf_sync_end_read(vk->capture.current->dmabuf_fd);
     }
 
-    // Submit command buffer
-    VkSemaphore wait_semaphores[] = { vk->image_available[vk->current_frame] };
-    VkPipelineStageFlags wait_stages[] = { VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT };
-    VkSemaphore signal_semaphores[] = { vk->render_finished[vk->current_frame] };
+    // Explicit sync (timeline semaphore)
+    VkSemaphore wait_semaphores[2];
+    uint64_t wait_values[2] = {0, 0};
+    VkPipelineStageFlags wait_stages[2] = { VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT };
+    uint32_t wait_count = 1;
+
+    wait_semaphores[0] = vk->image_available[vk->current_frame];
+
+    if (pfn_vkImportSemaphoreFdKHR && vk->capture.surface && vk->capture.surface->syncobj) {
+        struct server_drm_syncobj_surface *sync = vk->capture.surface->syncobj;
+        if (sync->acquire.fd != -1) {
+            if (sync->vk_sem == VK_NULL_HANDLE) {
+                VkSemaphoreTypeCreateInfo type_info = {
+                    .sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+                    .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
+                    .initialValue = 0,
+                };
+                VkSemaphoreCreateInfo info = {
+                    .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+                    .pNext = &type_info,
+                };
+                vkCreateSemaphore(vk->device, &info, NULL, &sync->vk_sem);
+            }
+
+            if (sync->imported_fd != sync->acquire.fd) {
+                int fd_dup = dup(sync->acquire.fd);
+                VkImportSemaphoreFdInfoKHR import = {
+                    .sType = VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR,
+                    .semaphore = sync->vk_sem,
+                    .flags = VK_SEMAPHORE_IMPORT_TEMPORARY_BIT,
+                    .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT,
+                    .fd = fd_dup,
+                };
+                if (pfn_vkImportSemaphoreFdKHR(vk->device, &import) == VK_SUCCESS) {
+                    sync->imported_fd = sync->acquire.fd;
+                } else {
+                    close(fd_dup);
+                }
+            }
+
+            if (sync->imported_fd == sync->acquire.fd) {
+                wait_semaphores[wait_count] = sync->vk_sem;
+                wait_values[wait_count] = ((uint64_t)sync->acquire.point_hi << 32) | sync->acquire.point_lo;
+                wait_count++;
+            }
+        }
+    }
+
+    VkTimelineSemaphoreSubmitInfo timeline_info = {
+        .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
+        .waitSemaphoreValueCount = wait_count,
+        .pWaitSemaphoreValues = wait_values,
+    };
+
+    VkSemaphore signal_semaphores[2];
+    uint64_t signal_values[2] = {0, 0};
+    uint32_t signal_count = 1;
+
+    signal_semaphores[0] = vk->render_finished[vk->current_frame];
+
+    // Handle explicit release (Signal)
+    if (pfn_vkImportSemaphoreFdKHR && vk->capture.surface && vk->capture.surface->syncobj) {
+        struct server_drm_syncobj_surface *sync = vk->capture.surface->syncobj;
+        if (sync->release.fd != -1) {
+            if (sync->vk_sem_release == VK_NULL_HANDLE) {
+                VkSemaphoreTypeCreateInfo type_info = {
+                    .sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+                    .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
+                    .initialValue = 0,
+                };
+                VkSemaphoreCreateInfo info = {
+                    .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+                    .pNext = &type_info,
+                };
+                vkCreateSemaphore(vk->device, &info, NULL, &sync->vk_sem_release);
+            }
+
+            if (sync->imported_release_fd != sync->release.fd) {
+                int fd_dup = dup(sync->release.fd);
+                VkImportSemaphoreFdInfoKHR import = {
+                    .sType = VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR,
+                    .semaphore = sync->vk_sem_release,
+                    .flags = VK_SEMAPHORE_IMPORT_TEMPORARY_BIT,
+                    .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT,
+                    .fd = fd_dup,
+                };
+                if (pfn_vkImportSemaphoreFdKHR(vk->device, &import) == VK_SUCCESS) {
+                    sync->imported_release_fd = sync->release.fd;
+                } else {
+                    close(fd_dup);
+                }
+            }
+
+            if (sync->imported_release_fd == sync->release.fd) {
+                signal_semaphores[signal_count] = sync->vk_sem_release;
+                signal_values[signal_count] = ((uint64_t)sync->release.point_hi << 32) | sync->release.point_lo;
+                signal_count++;
+            }
+        }
+    }
+
+    timeline_info.signalSemaphoreValueCount = signal_count;
+    timeline_info.pSignalSemaphoreValues = signal_values;
 
     VkSubmitInfo submit_info = {
         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-        .waitSemaphoreCount = 1,
+        .pNext = &timeline_info,
+        .waitSemaphoreCount = wait_count,
         .pWaitSemaphores = wait_semaphores,
         .pWaitDstStageMask = wait_stages,
         .commandBufferCount = 1,
         .pCommandBuffers = &cmd,
-        .signalSemaphoreCount = 1,
+        .signalSemaphoreCount = signal_count,
         .pSignalSemaphores = signal_semaphores,
     };
 
@@ -2108,6 +2697,10 @@ vk_buffer_destroy(struct vk_buffer *buffer) {
         vkDestroySemaphore(vk->device, buffer->acquire_semaphore, NULL);
     }
     if (buffer->parent) {
+        // Remove parent destroy listener if active
+        if (buffer->on_parent_destroy.link.prev || buffer->on_parent_destroy.link.next) {
+            wl_list_remove(&buffer->on_parent_destroy.link);
+        }
         server_buffer_unref(buffer->parent);
     }
 
@@ -2140,6 +2733,23 @@ drm_format_to_vk(uint32_t drm_format) {
     default:
         return VK_FORMAT_UNDEFINED;
     }
+}
+
+static void
+on_parent_buffer_destroy(struct wl_listener *listener, void *data) {
+    struct vk_buffer *vk_buf = wl_container_of(listener, vk_buf, on_parent_destroy);
+    struct server_vk *vk = vk_buf->vk;
+
+    // If this is the current buffer, clear the reference
+    if (vk->capture.current == vk_buf) {
+        vk->capture.current = NULL;
+    }
+
+    // Remove the listener before destroying (parent is already being destroyed)
+    wl_list_remove(&vk_buf->on_parent_destroy.link);
+    vk_buf->parent = NULL;  // Parent is being destroyed, don't try to unref
+
+    vk_buffer_destroy(vk_buf);
 }
 
 static struct vk_buffer *
@@ -2448,6 +3058,10 @@ vk_buffer_import(struct server_vk *vk, struct server_buffer *buffer) {
     vk_log(LOG_INFO, "imported dma-buf: %dx%d, format=0x%x, modifier=0x%llx",
            data->width, data->height, data->format, (unsigned long long)modifier);
 
+    // Listen for parent buffer destruction to clean up
+    vk_buffer->on_parent_destroy.notify = on_parent_buffer_destroy;
+    wl_signal_add(&buffer->events.resource_destroy, &vk_buffer->on_parent_destroy);
+
     wl_list_insert(&vk->capture.buffers, &vk_buffer->link);
     return vk_buffer;
 
@@ -2489,11 +3103,17 @@ on_surface_commit(struct wl_listener *listener, void *data) {
         vk->capture.current = vk_buf;
 
         // Render frame with Vulkan
-        server_vk_begin_frame(vk);
-        server_vk_end_frame(vk);
+        if (server_vk_begin_frame(vk)) {
+            server_vk_end_frame(vk);
+        }
     }
 
     wl_signal_emit_mutable(&vk->events.frame, NULL);
+
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint32_t time = ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+    server_surface_send_frame_done(vk->capture.surface, time);
 }
 
 static void
@@ -2508,7 +3128,7 @@ on_surface_destroy(struct wl_listener *listener, void *data) {
 }
 
 static void
-cleanup_swapchain(struct server_vk *vk) {
+cleanup_swapchain(struct server_vk *vk, bool destroy_swapchain) {
     // Wait for device to be idle before destroying
     vkDeviceWaitIdle(vk->device);
 
@@ -2539,7 +3159,7 @@ cleanup_swapchain(struct server_vk *vk) {
     vk->swapchain.images = NULL;
 
     // Destroy old swapchain
-    if (vk->swapchain.swapchain) {
+    if (destroy_swapchain && vk->swapchain.swapchain) {
         vkDestroySwapchainKHR(vk->device, vk->swapchain.swapchain, NULL);
         vk->swapchain.swapchain = VK_NULL_HANDLE;
     }
@@ -2551,11 +3171,16 @@ recreate_swapchain(struct server_vk *vk, uint32_t width, uint32_t height) {
         return true;  // Skip if minimized
     }
 
-    cleanup_swapchain(vk);
+    VkSwapchainKHR old_swapchain = vk->swapchain.swapchain;
+    cleanup_swapchain(vk, false);
 
-    if (!create_swapchain(vk, width, height)) {
+    if (!create_swapchain(vk, width, height, old_swapchain)) {
         vk_log(LOG_ERROR, "failed to recreate swapchain");
         return false;
+    }
+
+    if (old_swapchain != VK_NULL_HANDLE) {
+        vkDestroySwapchainKHR(vk->device, old_swapchain, NULL);
     }
 
     if (!create_framebuffers(vk)) {
@@ -2577,4 +3202,1054 @@ on_ui_resize(struct wl_listener *listener, void *data) {
     if (width > 0 && height > 0) {
         recreate_swapchain(vk, width, height);
     }
+}
+
+// ============================================================================
+// Mirror API
+// ============================================================================
+
+struct vk_mirror *
+server_vk_add_mirror(struct server_vk *vk, const struct vk_mirror_options *options) {
+    struct vk_mirror *mirror = zalloc(1, sizeof(*mirror));
+
+    mirror->src = options->src;
+    mirror->dst = options->dst;
+    mirror->color_key_enabled = options->color_key_enabled;
+    mirror->color_key_input = options->color_key_input;
+    mirror->color_key_output = options->color_key_output;
+    mirror->color_key_tolerance = options->color_key_tolerance > 0.0f ? options->color_key_tolerance : 0.1f;
+    mirror->enabled = true;
+
+    wl_list_insert(&vk->mirrors, &mirror->link);
+
+    // Count total mirrors
+    int count = 0;
+    struct vk_mirror *m;
+    wl_list_for_each(m, &vk->mirrors, link) count++;
+
+    vk_log(LOG_INFO, "added mirror #%d: src(%d,%d %dx%d) -> dst(%d,%d %dx%d) color_key=%d",
+           count,
+           mirror->src.x, mirror->src.y, mirror->src.width, mirror->src.height,
+           mirror->dst.x, mirror->dst.y, mirror->dst.width, mirror->dst.height,
+           mirror->color_key_enabled);
+
+    return mirror;
+}
+
+void
+server_vk_remove_mirror(struct server_vk *vk, struct vk_mirror *mirror) {
+    if (!mirror) return;
+
+    vk_log(LOG_INFO, "removing mirror: src(%d,%d %dx%d)",
+           mirror->src.x, mirror->src.y, mirror->src.width, mirror->src.height);
+
+    wl_list_remove(&mirror->link);
+    free(mirror);
+
+    // Count remaining
+    int count = 0;
+    struct vk_mirror *m;
+    wl_list_for_each(m, &vk->mirrors, link) count++;
+    vk_log(LOG_INFO, "mirrors remaining: %d", count);
+}
+
+void
+server_vk_mirror_set_enabled(struct vk_mirror *mirror, bool enabled) {
+    if (mirror) {
+        mirror->enabled = enabled;
+    }
+}
+
+// ============================================================================
+// Image API
+// ============================================================================
+
+struct vk_image *
+server_vk_add_image(struct server_vk *vk, const char *path, const struct vk_image_options *options) {
+    // Load PNG file
+    struct util_png png = util_png_decode(path, 8192);  // max 8192x8192
+    if (!png.data || png.width <= 0 || png.height <= 0) {
+        vk_log(LOG_ERROR, "failed to load PNG: %s", path);
+        return NULL;
+    }
+
+    vk_log(LOG_INFO, "loading image: %s (%dx%d)", path, png.width, png.height);
+
+    struct vk_image *image = zalloc(1, sizeof(*image));
+    image->width = png.width;
+    image->height = png.height;
+    image->dst = options->dst;
+    image->enabled = true;
+
+    // Create Vulkan image
+    VkImageCreateInfo image_ci = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .imageType = VK_IMAGE_TYPE_2D,
+        .format = VK_FORMAT_R8G8B8A8_UNORM,  // PNG is RGBA
+        .extent = { png.width, png.height, 1 },
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .tiling = VK_IMAGE_TILING_LINEAR,  // For direct CPU access
+        .usage = VK_IMAGE_USAGE_SAMPLED_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .initialLayout = VK_IMAGE_LAYOUT_PREINITIALIZED,
+    };
+
+    if (vkCreateImage(vk->device, &image_ci, NULL, &image->image) != VK_SUCCESS) {
+        vk_log(LOG_ERROR, "failed to create image for PNG");
+        free(png.data);
+        free(image);
+        return NULL;
+    }
+
+    // Get memory requirements
+    VkMemoryRequirements mem_reqs;
+    vkGetImageMemoryRequirements(vk->device, image->image, &mem_reqs);
+
+    // Find host-visible memory type for direct mapping
+    uint32_t mem_type = find_memory_type(vk, mem_reqs.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+    if (mem_type == UINT32_MAX) {
+        vk_log(LOG_ERROR, "no suitable memory type for image");
+        vkDestroyImage(vk->device, image->image, NULL);
+        free(png.data);
+        free(image);
+        return NULL;
+    }
+
+    VkMemoryAllocateInfo alloc_info = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = mem_reqs.size,
+        .memoryTypeIndex = mem_type,
+    };
+
+    if (vkAllocateMemory(vk->device, &alloc_info, NULL, &image->memory) != VK_SUCCESS) {
+        vk_log(LOG_ERROR, "failed to allocate image memory");
+        vkDestroyImage(vk->device, image->image, NULL);
+        free(png.data);
+        free(image);
+        return NULL;
+    }
+
+    vkBindImageMemory(vk->device, image->image, image->memory, 0);
+
+    // Map memory and copy PNG data
+    void *mapped;
+    if (vkMapMemory(vk->device, image->memory, 0, mem_reqs.size, 0, &mapped) != VK_SUCCESS) {
+        vk_log(LOG_ERROR, "failed to map image memory");
+        vkFreeMemory(vk->device, image->memory, NULL);
+        vkDestroyImage(vk->device, image->image, NULL);
+        free(png.data);
+        free(image);
+        return NULL;
+    }
+
+    // Get image subresource layout for proper row pitch
+    VkImageSubresource subres = { .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT };
+    VkSubresourceLayout layout;
+    vkGetImageSubresourceLayout(vk->device, image->image, &subres, &layout);
+
+    // Copy row by row to handle potential padding
+    const char *src = png.data;
+    char *dst = (char *)mapped + layout.offset;
+    size_t src_row_size = png.width * 4;  // RGBA = 4 bytes per pixel
+
+    for (int y = 0; y < png.height; y++) {
+        memcpy(dst, src, src_row_size);
+        src += src_row_size;
+        dst += layout.rowPitch;
+    }
+
+    vkUnmapMemory(vk->device, image->memory);
+    free(png.data);
+
+    // Transition image layout (need command buffer)
+    VkCommandBuffer cmd;
+    VkCommandBufferAllocateInfo cmd_alloc = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = vk->command_pool,
+        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+        .commandBufferCount = 1,
+    };
+    vkAllocateCommandBuffers(vk->device, &cmd_alloc, &cmd);
+
+    VkCommandBufferBeginInfo begin_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
+    vkBeginCommandBuffer(cmd, &begin_info);
+
+    VkImageMemoryBarrier barrier = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .oldLayout = VK_IMAGE_LAYOUT_PREINITIALIZED,
+        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = image->image,
+        .subresourceRange = {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .baseMipLevel = 0,
+            .levelCount = 1,
+            .baseArrayLayer = 0,
+            .layerCount = 1,
+        },
+        .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+    };
+
+    vkCmdPipelineBarrier(cmd,
+        VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+        0, 0, NULL, 0, NULL, 1, &barrier);
+
+    vkEndCommandBuffer(cmd);
+
+    VkSubmitInfo submit = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &cmd,
+    };
+    vkQueueSubmit(vk->graphics_queue, 1, &submit, VK_NULL_HANDLE);
+    vkQueueWaitIdle(vk->graphics_queue);
+    vkFreeCommandBuffers(vk->device, vk->command_pool, 1, &cmd);
+
+    // Create image view
+    VkImageViewCreateInfo view_ci = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .image = image->image,
+        .viewType = VK_IMAGE_VIEW_TYPE_2D,
+        .format = VK_FORMAT_R8G8B8A8_UNORM,
+        .subresourceRange = {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .baseMipLevel = 0,
+            .levelCount = 1,
+            .baseArrayLayer = 0,
+            .layerCount = 1,
+        },
+    };
+
+    if (vkCreateImageView(vk->device, &view_ci, NULL, &image->view) != VK_SUCCESS) {
+        vk_log(LOG_ERROR, "failed to create image view");
+        vkFreeMemory(vk->device, image->memory, NULL);
+        vkDestroyImage(vk->device, image->image, NULL);
+        free(image);
+        return NULL;
+    }
+
+    // Allocate descriptor set
+    VkDescriptorSetAllocateInfo ds_alloc = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = vk->descriptor_pool,
+        .descriptorSetCount = 1,
+        .pSetLayouts = &vk->image_pipeline.descriptor_layout,
+    };
+
+    if (vkAllocateDescriptorSets(vk->device, &ds_alloc, &image->descriptor_set) != VK_SUCCESS) {
+        vk_log(LOG_ERROR, "failed to allocate image descriptor set");
+        vkDestroyImageView(vk->device, image->view, NULL);
+        vkFreeMemory(vk->device, image->memory, NULL);
+        vkDestroyImage(vk->device, image->image, NULL);
+        free(image);
+        return NULL;
+    }
+
+    // Update descriptor set
+    VkDescriptorImageInfo img_info = {
+        .sampler = vk->sampler,
+        .imageView = image->view,
+        .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+    };
+
+    VkWriteDescriptorSet write = {
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .dstSet = image->descriptor_set,
+        .dstBinding = 0,
+        .dstArrayElement = 0,
+        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+        .descriptorCount = 1,
+        .pImageInfo = &img_info,
+    };
+
+    vkUpdateDescriptorSets(vk->device, 1, &write, 0, NULL);
+
+    // Add to list
+    wl_list_insert(&vk->images, &image->link);
+
+    vk_log(LOG_INFO, "added image: %dx%d -> dst(%d,%d %dx%d)",
+           image->width, image->height,
+           image->dst.x, image->dst.y, image->dst.width, image->dst.height);
+
+    return image;
+}
+
+void
+server_vk_remove_image(struct server_vk *vk, struct vk_image *image) {
+    if (!image) return;
+
+    vk_log(LOG_INFO, "removing image: %dx%d", image->width, image->height);
+
+    // Wait for GPU to finish using this image
+    vkDeviceWaitIdle(vk->device);
+
+    // Free descriptor set back to pool
+    if (image->descriptor_set != VK_NULL_HANDLE) {
+        vkFreeDescriptorSets(vk->device, vk->descriptor_pool, 1, &image->descriptor_set);
+    }
+
+    // Destroy Vulkan resources
+    if (image->view) {
+        vkDestroyImageView(vk->device, image->view, NULL);
+    }
+    if (image->memory) {
+        vkFreeMemory(vk->device, image->memory, NULL);
+    }
+    if (image->image) {
+        vkDestroyImage(vk->device, image->image, NULL);
+    }
+
+    wl_list_remove(&image->link);
+    free(image);
+}
+
+void
+server_vk_image_set_enabled(struct vk_image *image, bool enabled) {
+    if (image) {
+        image->enabled = enabled;
+    }
+}
+
+// ============================================================================
+// Text Rendering
+// ============================================================================
+
+#define VK_FONT_ATLAS_SIZE 1024
+
+// Text vertex structure (matches text.frag expectations)
+struct text_vertex {
+    float src_pos[2];   // UV coords in font atlas
+    float src_rgba[4];  // Unused
+    float dst_rgba[4];  // Text color with alpha
+};
+
+// UTF-8 decode helper
+static uint32_t
+vk_utf8_decode(const char **str) {
+    const unsigned char *s = (const unsigned char *)*str;
+    uint32_t cp;
+    int len;
+
+    if (s[0] < 0x80) { cp = s[0]; len = 1; }
+    else if ((s[0] & 0xE0) == 0xC0) { cp = ((s[0] & 0x1F) << 6) | (s[1] & 0x3F); len = 2; }
+    else if ((s[0] & 0xF0) == 0xE0) { cp = ((s[0] & 0x0F) << 12) | ((s[1] & 0x3F) << 6) | (s[2] & 0x3F); len = 3; }
+    else if ((s[0] & 0xF8) == 0xF0) { cp = ((s[0] & 0x07) << 18) | ((s[1] & 0x3F) << 12) |
+                                        ((s[2] & 0x3F) << 6) | (s[3] & 0x3F); len = 4; }
+    else { cp = 0xFFFD; len = 1; }
+
+    *str += len;
+    return cp;
+}
+
+// Initialize FreeType font system
+static bool
+init_font_system(struct server_vk *vk, const char *font_path, uint32_t base_size) {
+    FT_Library ft;
+    if (FT_Init_FreeType(&ft) != 0) {
+        vk_log(LOG_ERROR, "failed to initialize FreeType");
+        return false;
+    }
+    vk->font.ft_library = ft;
+
+    FT_Face face;
+    if (FT_New_Face(ft, font_path, 0, &face) != 0) {
+        vk_log(LOG_ERROR, "failed to load font: %s", font_path);
+        FT_Done_FreeType(ft);
+        vk->font.ft_library = NULL;
+        return false;
+    }
+    vk->font.ft_face = face;
+    vk->font.base_font_size = base_size > 0 ? base_size : 16;
+    vk->font.sizes = NULL;
+    vk->font.sizes_count = 0;
+    vk->font.sizes_capacity = 0;
+
+    vk_log(LOG_INFO, "initialized font system: %s (base size %u)", font_path, vk->font.base_font_size);
+    return true;
+}
+
+static void
+destroy_font_system(struct server_vk *vk) {
+    // Destroy all font size caches
+    for (size_t i = 0; i < vk->font.sizes_count; i++) {
+        struct vk_font_size *fs = &vk->font.sizes[i];
+        if (fs->atlas_view) vkDestroyImageView(vk->device, fs->atlas_view, NULL);
+        if (fs->atlas_memory) vkFreeMemory(vk->device, fs->atlas_memory, NULL);
+        if (fs->atlas_image) vkDestroyImage(vk->device, fs->atlas_image, NULL);
+        free(fs->glyphs);
+    }
+    free(vk->font.sizes);
+    vk->font.sizes = NULL;
+    vk->font.sizes_count = 0;
+
+    if (vk->font.ft_face) {
+        FT_Done_Face((FT_Face)vk->font.ft_face);
+        vk->font.ft_face = NULL;
+    }
+    if (vk->font.ft_library) {
+        FT_Done_FreeType((FT_Library)vk->font.ft_library);
+        vk->font.ft_library = NULL;
+    }
+}
+
+// Get or create font size cache
+static struct vk_font_size *
+get_font_size(struct server_vk *vk, uint32_t size) {
+    // Look for existing
+    for (size_t i = 0; i < vk->font.sizes_count; i++) {
+        if (vk->font.sizes[i].size == size) {
+            return &vk->font.sizes[i];
+        }
+    }
+
+    // Create new
+    if (vk->font.sizes_count >= vk->font.sizes_capacity) {
+        size_t new_cap = vk->font.sizes_capacity ? vk->font.sizes_capacity * 2 : 4;
+        struct vk_font_size *new_sizes = realloc(vk->font.sizes, new_cap * sizeof(*new_sizes));
+        if (!new_sizes) return NULL;
+        vk->font.sizes = new_sizes;
+        vk->font.sizes_capacity = new_cap;
+    }
+
+    struct vk_font_size *fs = &vk->font.sizes[vk->font.sizes_count++];
+    memset(fs, 0, sizeof(*fs));
+    fs->size = size;
+    fs->glyph_capacity = 128;
+    fs->glyphs = zalloc(fs->glyph_capacity, sizeof(struct vk_glyph));
+    fs->atlas_width = VK_FONT_ATLAS_SIZE;
+    fs->atlas_height = VK_FONT_ATLAS_SIZE;
+
+    // Set FreeType size
+    FT_Face face = (FT_Face)vk->font.ft_face;
+    FT_Set_Pixel_Sizes(face, 0, size);
+
+    // Create atlas image
+    VkImageCreateInfo image_ci = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .imageType = VK_IMAGE_TYPE_2D,
+        .format = VK_FORMAT_R8_UNORM,  // Single channel for font glyphs
+        .extent = { fs->atlas_width, fs->atlas_height, 1 },
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .tiling = VK_IMAGE_TILING_LINEAR,
+        .usage = VK_IMAGE_USAGE_SAMPLED_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .initialLayout = VK_IMAGE_LAYOUT_PREINITIALIZED,
+    };
+
+    if (vkCreateImage(vk->device, &image_ci, NULL, &fs->atlas_image) != VK_SUCCESS) {
+        vk_log(LOG_ERROR, "failed to create font atlas image");
+        vk->font.sizes_count--;
+        return NULL;
+    }
+
+    VkMemoryRequirements mem_reqs;
+    vkGetImageMemoryRequirements(vk->device, fs->atlas_image, &mem_reqs);
+
+    uint32_t mem_type = find_memory_type(vk, mem_reqs.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+    VkMemoryAllocateInfo alloc_info = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = mem_reqs.size,
+        .memoryTypeIndex = mem_type,
+    };
+
+    if (vkAllocateMemory(vk->device, &alloc_info, NULL, &fs->atlas_memory) != VK_SUCCESS) {
+        vk_log(LOG_ERROR, "failed to allocate font atlas memory");
+        vkDestroyImage(vk->device, fs->atlas_image, NULL);
+        vk->font.sizes_count--;
+        return NULL;
+    }
+
+    vkBindImageMemory(vk->device, fs->atlas_image, fs->atlas_memory, 0);
+
+    // Clear atlas to zero
+    void *mapped;
+    if (vkMapMemory(vk->device, fs->atlas_memory, 0, mem_reqs.size, 0, &mapped) == VK_SUCCESS) {
+        memset(mapped, 0, mem_reqs.size);
+        vkUnmapMemory(vk->device, fs->atlas_memory);
+    }
+
+    // Create image view
+    VkImageViewCreateInfo view_ci = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .image = fs->atlas_image,
+        .viewType = VK_IMAGE_VIEW_TYPE_2D,
+        .format = VK_FORMAT_R8_UNORM,
+        .subresourceRange = {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .baseMipLevel = 0,
+            .levelCount = 1,
+            .baseArrayLayer = 0,
+            .layerCount = 1,
+        },
+    };
+
+    if (vkCreateImageView(vk->device, &view_ci, NULL, &fs->atlas_view) != VK_SUCCESS) {
+        vk_log(LOG_ERROR, "failed to create font atlas view");
+        vkFreeMemory(vk->device, fs->atlas_memory, NULL);
+        vkDestroyImage(vk->device, fs->atlas_image, NULL);
+        vk->font.sizes_count--;
+        return NULL;
+    }
+
+    // Allocate descriptor set
+    VkDescriptorSetAllocateInfo ds_alloc = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = vk->descriptor_pool,
+        .descriptorSetCount = 1,
+        .pSetLayouts = &vk->text_vk_pipeline.descriptor_layout,
+    };
+
+    if (vkAllocateDescriptorSets(vk->device, &ds_alloc, &fs->atlas_descriptor) != VK_SUCCESS) {
+        vk_log(LOG_ERROR, "failed to allocate font atlas descriptor");
+        vkDestroyImageView(vk->device, fs->atlas_view, NULL);
+        vkFreeMemory(vk->device, fs->atlas_memory, NULL);
+        vkDestroyImage(vk->device, fs->atlas_image, NULL);
+        vk->font.sizes_count--;
+        return NULL;
+    }
+
+    // Update descriptor set
+    VkDescriptorImageInfo img_info = {
+        .sampler = vk->sampler,
+        .imageView = fs->atlas_view,
+        .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+    };
+
+    VkWriteDescriptorSet write = {
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .dstSet = fs->atlas_descriptor,
+        .dstBinding = 0,
+        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+        .descriptorCount = 1,
+        .pImageInfo = &img_info,
+    };
+
+    vkUpdateDescriptorSets(vk->device, 1, &write, 0, NULL);
+    fs->atlas_initialized = true;
+
+    vk_log(LOG_INFO, "created font size cache: %u px", size);
+    return fs;
+}
+
+// Get or render glyph
+static struct vk_glyph *
+get_glyph(struct server_vk *vk, struct vk_font_size *fs, uint32_t codepoint) {
+    // Look for existing
+    for (size_t i = 0; i < fs->glyph_count; i++) {
+        if (fs->glyphs[i].codepoint == codepoint) {
+            return &fs->glyphs[i];
+        }
+    }
+
+    // Render new glyph
+    FT_Face face = (FT_Face)vk->font.ft_face;
+    FT_Set_Pixel_Sizes(face, 0, fs->size);
+
+    if (FT_Load_Char(face, codepoint, FT_LOAD_RENDER) != 0) {
+        return NULL;  // Glyph not available
+    }
+
+    FT_GlyphSlot g = face->glyph;
+
+    // Check if we need to expand glyphs array
+    if (fs->glyph_count >= fs->glyph_capacity) {
+        fs->glyph_capacity *= 2;
+        fs->glyphs = realloc(fs->glyphs, fs->glyph_capacity * sizeof(struct vk_glyph));
+    }
+
+    // Check if glyph fits in current row
+    if (fs->atlas_x + (int)g->bitmap.width > fs->atlas_width) {
+        fs->atlas_x = 0;
+        fs->atlas_y += fs->atlas_row_height + 1;
+        fs->atlas_row_height = 0;
+    }
+
+    // Check if atlas is full
+    if (fs->atlas_y + (int)g->bitmap.rows > fs->atlas_height) {
+        vk_log(LOG_WARN, "font atlas full for size %u", fs->size);
+        return NULL;
+    }
+
+    struct vk_glyph *glyph = &fs->glyphs[fs->glyph_count++];
+    glyph->codepoint = codepoint;
+    glyph->width = g->bitmap.width;
+    glyph->height = g->bitmap.rows;
+    glyph->bearing_x = g->bitmap_left;
+    glyph->bearing_y = g->bitmap_top;
+    glyph->advance = g->advance.x >> 6;
+    glyph->atlas_x = fs->atlas_x;
+    glyph->atlas_y = fs->atlas_y;
+
+    // Copy glyph bitmap to atlas
+    if (g->bitmap.buffer && g->bitmap.width > 0 && g->bitmap.rows > 0) {
+        void *mapped;
+        VkMemoryRequirements mem_reqs;
+        vkGetImageMemoryRequirements(vk->device, fs->atlas_image, &mem_reqs);
+
+        if (vkMapMemory(vk->device, fs->atlas_memory, 0, mem_reqs.size, 0, &mapped) == VK_SUCCESS) {
+            VkImageSubresource subres = { .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT };
+            VkSubresourceLayout layout;
+            vkGetImageSubresourceLayout(vk->device, fs->atlas_image, &subres, &layout);
+
+            unsigned char *dst = (unsigned char *)mapped + layout.offset;
+            for (unsigned int y = 0; y < g->bitmap.rows; y++) {
+                unsigned char *row = dst + ((fs->atlas_y + y) * layout.rowPitch) + fs->atlas_x;
+                memcpy(row, g->bitmap.buffer + y * g->bitmap.pitch, g->bitmap.width);
+            }
+            vkUnmapMemory(vk->device, fs->atlas_memory);
+        }
+    }
+
+    // Update packing position
+    fs->atlas_x += glyph->width + 1;
+    if (glyph->height > fs->atlas_row_height) {
+        fs->atlas_row_height = glyph->height;
+    }
+
+    return glyph;
+}
+
+// Create text pipeline
+static bool
+create_text_vk_pipeline(struct server_vk *vk) {
+    // Create descriptor set layout (same as image - combined image sampler)
+    if (!create_descriptor_set_layout(vk, &vk->text_vk_pipeline.descriptor_layout)) {
+        vk_log(LOG_ERROR, "failed to create text descriptor set layout");
+        return false;
+    }
+
+    // Pipeline layout
+    VkPipelineLayoutCreateInfo layout_info = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 1,
+        .pSetLayouts = &vk->text_vk_pipeline.descriptor_layout,
+    };
+
+    if (vkCreatePipelineLayout(vk->device, &layout_info, NULL, &vk->text_vk_pipeline.layout) != VK_SUCCESS) {
+        vk_log(LOG_ERROR, "failed to create text pipeline layout");
+        return false;
+    }
+
+    // Use the text.frag shader
+    VkShaderModule text_frag = create_shader_module(vk->device, text_frag_spv, text_frag_spv_size);
+    if (!text_frag) {
+        vk_log(LOG_ERROR, "failed to create text shader module");
+        return false;
+    }
+
+    // Shader stages (reuse texcopy vertex shader)
+    VkPipelineShaderStageCreateInfo shader_stages[] = {
+        {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .stage = VK_SHADER_STAGE_VERTEX_BIT,
+            .module = vk->texcopy_pipeline.vert,
+            .pName = "main",
+        },
+        {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+            .module = text_frag,
+            .pName = "main",
+        },
+    };
+
+    // Vertex input for text (matches text.frag inputs)
+    VkVertexInputBindingDescription binding = {
+        .binding = 0,
+        .stride = sizeof(struct text_vertex),
+        .inputRate = VK_VERTEX_INPUT_RATE_VERTEX,
+    };
+
+    VkVertexInputAttributeDescription attributes[] = {
+        { .location = 0, .binding = 0, .format = VK_FORMAT_R32G32_SFLOAT, .offset = 0 },  // src_pos (UV)
+        { .location = 1, .binding = 0, .format = VK_FORMAT_R32G32B32A32_SFLOAT, .offset = sizeof(float) * 2 },  // src_rgba
+        { .location = 2, .binding = 0, .format = VK_FORMAT_R32G32B32A32_SFLOAT, .offset = sizeof(float) * 6 },  // dst_rgba
+    };
+
+    VkPipelineVertexInputStateCreateInfo vertex_input = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+        .vertexBindingDescriptionCount = 1,
+        .pVertexBindingDescriptions = &binding,
+        .vertexAttributeDescriptionCount = ARRAY_LEN(attributes),
+        .pVertexAttributeDescriptions = attributes,
+    };
+
+    VkPipelineInputAssemblyStateCreateInfo input_assembly = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+        .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+    };
+
+    VkDynamicState dynamic_states[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    VkPipelineDynamicStateCreateInfo dynamic_state = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+        .dynamicStateCount = ARRAY_LEN(dynamic_states),
+        .pDynamicStates = dynamic_states,
+    };
+
+    VkPipelineViewportStateCreateInfo viewport_state = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+        .viewportCount = 1,
+        .scissorCount = 1,
+    };
+
+    VkPipelineRasterizationStateCreateInfo rasterization = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+        .polygonMode = VK_POLYGON_MODE_FILL,
+        .lineWidth = 1.0f,
+        .cullMode = VK_CULL_MODE_NONE,
+        .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE,
+    };
+
+    VkPipelineMultisampleStateCreateInfo multisampling = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+        .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
+    };
+
+    // Alpha blending for text
+    VkPipelineColorBlendAttachmentState blend_attachment = {
+        .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                          VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
+        .blendEnable = VK_TRUE,
+        .srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA,
+        .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+        .colorBlendOp = VK_BLEND_OP_ADD,
+        .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
+        .dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO,
+        .alphaBlendOp = VK_BLEND_OP_ADD,
+    };
+
+    VkPipelineColorBlendStateCreateInfo color_blending = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+        .attachmentCount = 1,
+        .pAttachments = &blend_attachment,
+    };
+
+    VkGraphicsPipelineCreateInfo pipeline_ci = {
+        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+        .stageCount = ARRAY_LEN(shader_stages),
+        .pStages = shader_stages,
+        .pVertexInputState = &vertex_input,
+        .pInputAssemblyState = &input_assembly,
+        .pViewportState = &viewport_state,
+        .pRasterizationState = &rasterization,
+        .pMultisampleState = &multisampling,
+        .pColorBlendState = &color_blending,
+        .pDynamicState = &dynamic_state,
+        .layout = vk->text_vk_pipeline.layout,
+        .renderPass = vk->render_pass,
+        .subpass = 0,
+    };
+
+    VkResult result = vkCreateGraphicsPipelines(vk->device, VK_NULL_HANDLE, 1, &pipeline_ci, NULL, &vk->text_vk_pipeline.pipeline);
+    vkDestroyShaderModule(vk->device, text_frag, NULL);
+
+    if (result != VK_SUCCESS) {
+        vk_log(LOG_ERROR, "failed to create text pipeline: %d", result);
+        return false;
+    }
+
+    vk_log(LOG_INFO, "created text pipeline");
+    return true;
+}
+
+// Draw all text objects
+static void
+draw_texts(struct server_vk *vk, VkCommandBuffer cmd) {
+    if (wl_list_empty(&vk->texts)) {
+        return;
+    }
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk->text_vk_pipeline.pipeline);
+
+    struct vk_text *text;
+    wl_list_for_each(text, &vk->texts, link) {
+        if (!text->enabled || !text->font || text->vertex_count == 0) {
+            continue;
+        }
+
+        // Bind font atlas descriptor
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                vk->text_vk_pipeline.layout, 0, 1,
+                                &text->font->atlas_descriptor, 0, NULL);
+
+        // Bind vertex buffer
+        VkDeviceSize offset = 0;
+        vkCmdBindVertexBuffers(cmd, 0, 1, &text->vertex_buffer, &offset);
+
+        // Set viewport to cover entire screen
+        VkViewport viewport = {
+            .x = 0, .y = 0,
+            .width = (float)vk->swapchain.extent.width,
+            .height = (float)vk->swapchain.extent.height,
+            .minDepth = 0.0f, .maxDepth = 1.0f,
+        };
+        vkCmdSetViewport(cmd, 0, 1, &viewport);
+
+        VkRect2D scissor = {
+            .offset = { 0, 0 },
+            .extent = vk->swapchain.extent,
+        };
+        vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+        vkCmdDraw(cmd, text->vertex_count, 1, 0, 0);
+    }
+}
+
+// Build text vertex buffer
+static bool
+build_text_vertices(struct server_vk *vk, struct vk_text *text) {
+    if (!text->text || text->text[0] == '\0' || !text->font) {
+        text->vertex_count = 0;
+        return true;
+    }
+
+    // Count characters
+    size_t char_count = 0;
+    const char *p = text->text;
+    while (*p) {
+        vk_utf8_decode(&p);
+        char_count++;
+    }
+
+    // Allocate vertices (6 per character for 2 triangles)
+    size_t vertex_count = char_count * 6;
+    struct text_vertex *vertices = zalloc(vertex_count, sizeof(*vertices));
+
+    float color[4] = {
+        ((text->color >> 24) & 0xFF) / 255.0f,
+        ((text->color >> 16) & 0xFF) / 255.0f,
+        ((text->color >> 8) & 0xFF) / 255.0f,
+        (text->color & 0xFF) / 255.0f,
+    };
+
+    int32_t x = text->x;
+    int32_t y = text->y;
+    size_t vtx_idx = 0;
+    float atlas_w = (float)text->font->atlas_width;
+    float atlas_h = (float)text->font->atlas_height;
+    float screen_w = (float)vk->swapchain.extent.width;
+    float screen_h = (float)vk->swapchain.extent.height;
+
+    p = text->text;
+    while (*p) {
+        uint32_t cp = vk_utf8_decode(&p);
+
+        if (cp == '\n') {
+            y += text->size * vk->font.base_font_size / text->size + 4;
+            x = text->x;
+            continue;
+        }
+
+        struct vk_glyph *g = get_glyph(vk, text->font, cp);
+        if (!g) continue;
+
+        // Calculate screen position (normalized device coords from pixel coords)
+        float px = (float)(x + g->bearing_x);
+        float py = (float)(y - g->bearing_y + (int)text->font->size);
+        float pw = (float)g->width;
+        float ph = (float)g->height;
+
+        // UV coords in atlas (normalized)
+        float u0 = g->atlas_x / atlas_w;
+        float v0 = g->atlas_y / atlas_h;
+        float u1 = (g->atlas_x + g->width) / atlas_w;
+        float v1 = (g->atlas_y + g->height) / atlas_h;
+
+        // Screen coords (normalized to 0-1)
+        float x0 = px / screen_w * 2.0f - 1.0f;
+        float y0 = py / screen_h * 2.0f - 1.0f;
+        float x1 = (px + pw) / screen_w * 2.0f - 1.0f;
+        float y1 = (py + ph) / screen_h * 2.0f - 1.0f;
+
+        // Generate 6 vertices for 2 triangles
+        // Triangle 1
+        vertices[vtx_idx].src_pos[0] = u0; vertices[vtx_idx].src_pos[1] = v0;
+        memcpy(vertices[vtx_idx].dst_rgba, color, sizeof(color));
+        vtx_idx++;
+
+        vertices[vtx_idx].src_pos[0] = u1; vertices[vtx_idx].src_pos[1] = v0;
+        memcpy(vertices[vtx_idx].dst_rgba, color, sizeof(color));
+        vtx_idx++;
+
+        vertices[vtx_idx].src_pos[0] = u1; vertices[vtx_idx].src_pos[1] = v1;
+        memcpy(vertices[vtx_idx].dst_rgba, color, sizeof(color));
+        vtx_idx++;
+
+        // Triangle 2
+        vertices[vtx_idx].src_pos[0] = u0; vertices[vtx_idx].src_pos[1] = v0;
+        memcpy(vertices[vtx_idx].dst_rgba, color, sizeof(color));
+        vtx_idx++;
+
+        vertices[vtx_idx].src_pos[0] = u1; vertices[vtx_idx].src_pos[1] = v1;
+        memcpy(vertices[vtx_idx].dst_rgba, color, sizeof(color));
+        vtx_idx++;
+
+        vertices[vtx_idx].src_pos[0] = u0; vertices[vtx_idx].src_pos[1] = v1;
+        memcpy(vertices[vtx_idx].dst_rgba, color, sizeof(color));
+        vtx_idx++;
+
+        x += g->advance;
+    }
+
+    text->vertex_count = vtx_idx;
+
+    // Create or update vertex buffer
+    if (text->vertex_buffer) {
+        vkDeviceWaitIdle(vk->device);
+        vkFreeMemory(vk->device, text->vertex_memory, NULL);
+        vkDestroyBuffer(vk->device, text->vertex_buffer, NULL);
+        text->vertex_buffer = VK_NULL_HANDLE;
+        text->vertex_memory = VK_NULL_HANDLE;
+    }
+
+    if (vtx_idx == 0) {
+        free(vertices);
+        return true;
+    }
+
+    VkBufferCreateInfo buffer_ci = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = vtx_idx * sizeof(struct text_vertex),
+        .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+    };
+
+    if (vkCreateBuffer(vk->device, &buffer_ci, NULL, &text->vertex_buffer) != VK_SUCCESS) {
+        free(vertices);
+        return false;
+    }
+
+    VkMemoryRequirements mem_reqs;
+    vkGetBufferMemoryRequirements(vk->device, text->vertex_buffer, &mem_reqs);
+
+    uint32_t mem_type = find_memory_type(vk, mem_reqs.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+    VkMemoryAllocateInfo alloc_info = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = mem_reqs.size,
+        .memoryTypeIndex = mem_type,
+    };
+
+    if (vkAllocateMemory(vk->device, &alloc_info, NULL, &text->vertex_memory) != VK_SUCCESS) {
+        vkDestroyBuffer(vk->device, text->vertex_buffer, NULL);
+        text->vertex_buffer = VK_NULL_HANDLE;
+        free(vertices);
+        return false;
+    }
+
+    vkBindBufferMemory(vk->device, text->vertex_buffer, text->vertex_memory, 0);
+
+    void *mapped;
+    if (vkMapMemory(vk->device, text->vertex_memory, 0, buffer_ci.size, 0, &mapped) == VK_SUCCESS) {
+        memcpy(mapped, vertices, vtx_idx * sizeof(struct text_vertex));
+        vkUnmapMemory(vk->device, text->vertex_memory);
+    }
+
+    free(vertices);
+    text->dirty = false;
+    return true;
+}
+
+// Text API implementation
+struct vk_text *
+server_vk_add_text(struct server_vk *vk, const char *str, const struct vk_text_options *options) {
+    if (!vk->font.ft_face) {
+        vk_log(LOG_ERROR, "font not initialized");
+        return NULL;
+    }
+
+    struct vk_text *text = zalloc(1, sizeof(*text));
+    text->vk = vk;
+    text->text = strdup(str ? str : "");
+    text->x = options->x;
+    text->y = options->y;
+    text->size = options->size > 0 ? options->size : 1;
+    text->color = options->color;
+    text->enabled = true;
+    text->dirty = true;
+
+    // Get font size cache (size multiplied by base font size)
+    uint32_t font_size = text->size * vk->font.base_font_size;
+    text->font = get_font_size(vk, font_size);
+    if (!text->font) {
+        free(text->text);
+        free(text);
+        return NULL;
+    }
+
+    // Build initial vertices
+    if (!build_text_vertices(vk, text)) {
+        free(text->text);
+        free(text);
+        return NULL;
+    }
+
+    wl_list_insert(&vk->texts, &text->link);
+
+    vk_log(LOG_INFO, "added text: \"%s\" at (%d,%d) size=%u color=0x%08x",
+           text->text, text->x, text->y, text->size, text->color);
+
+    return text;
+}
+
+void
+server_vk_remove_text(struct server_vk *vk, struct vk_text *text) {
+    if (!text) return;
+
+    vk_log(LOG_INFO, "removing text: \"%s\"", text->text);
+
+    vkDeviceWaitIdle(vk->device);
+
+    if (text->vertex_buffer) {
+        vkFreeMemory(vk->device, text->vertex_memory, NULL);
+        vkDestroyBuffer(vk->device, text->vertex_buffer, NULL);
+    }
+
+    wl_list_remove(&text->link);
+    free(text->text);
+    free(text);
+}
+
+void
+server_vk_text_set_enabled(struct vk_text *text, bool enabled) {
+    if (text) {
+        text->enabled = enabled;
+    }
+}
+
+void
+server_vk_text_set_text(struct vk_text *text, const char *new_text) {
+    if (!text) return;
+
+    free(text->text);
+    text->text = strdup(new_text ? new_text : "");
+    text->dirty = true;
+
+    // Rebuild vertices immediately
+    build_text_vertices(text->vk, text);
+}
+
+void
+server_vk_text_set_color(struct vk_text *text, uint32_t color) {
+    if (!text) return;
+
+    text->color = color;
+    text->dirty = true;
+
+    // Rebuild vertices immediately
+    build_text_vertices(text->vk, text);
 }

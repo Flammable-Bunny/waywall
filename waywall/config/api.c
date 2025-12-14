@@ -9,6 +9,7 @@
 #include "irc.h"
 #include "scene.h"
 #include "server/server.h"
+#include "server/vk.h"
 #include "server/wl_seat.h"
 #include "server/wp_relative_pointer.h"
 #include "timer.h"
@@ -79,6 +80,9 @@ static const struct {
 
 #define METATABLE_IMAGE "waywall.image"
 #define METATABLE_MIRROR "waywall.mirror"
+#define METATABLE_VK_MIRROR "waywall.vk_mirror"
+#define METATABLE_VK_IMAGE "waywall.vk_image"
+#define METATABLE_VK_TEXT "waywall.vk_text"
 #define METATABLE_TEXT "waywall.text"
 #define METATABLE_IRC "waywall.irc"
 #define METATABLE_HTTP "waywall.http"
@@ -87,6 +91,11 @@ static const struct {
 #define STARTUP_ERRMSG(function) function " cannot be called during startup"
 
 #define DEFAULT_DEPTH 0
+
+#define CHECK_SCENE(wrap, L) \
+    if (!wrap->scene) { \
+        return luaL_error(L, "scene is disabled (Vulkan-only mode)"); \
+    }
 
 struct waker_sleep {
     struct ww_timer_entry *timer;
@@ -178,6 +187,274 @@ image_gc(lua_State *L) {
         scene_object_destroy((struct scene_object *)*image);
     }
     *image = NULL;
+
+    return 0;
+}
+
+static int
+vk_mirror_close(lua_State *L) {
+    struct vk_mirror **mirror = lua_touserdata(L, 1);
+
+    if (!*mirror) {
+        return luaL_error(L, "cannot close mirror more than once");
+    }
+
+    struct config_vm *vm = config_vm_from(L);
+    struct wrap *wrap = config_vm_get_wrap(vm);
+    if (wrap && wrap->vk) {
+        server_vk_remove_mirror(wrap->vk, *mirror);
+    }
+    *mirror = NULL;
+
+    return 0;
+}
+
+static int
+vk_mirror_show(lua_State *L) {
+    struct vk_mirror **mirror = lua_touserdata(L, 1);
+    if (*mirror) {
+        server_vk_mirror_set_enabled(*mirror, true);
+    }
+    return 0;
+}
+
+static int
+vk_mirror_hide(lua_State *L) {
+    struct vk_mirror **mirror = lua_touserdata(L, 1);
+    if (*mirror) {
+        server_vk_mirror_set_enabled(*mirror, false);
+    }
+    return 0;
+}
+
+static int
+vk_mirror_index(lua_State *L) {
+    const char *key = luaL_checkstring(L, 2);
+
+    if (strcmp(key, "close") == 0) {
+        lua_pushcfunction(L, vk_mirror_close);
+    } else if (strcmp(key, "show") == 0) {
+        lua_pushcfunction(L, vk_mirror_show);
+    } else if (strcmp(key, "hide") == 0) {
+        lua_pushcfunction(L, vk_mirror_hide);
+    } else {
+        lua_pushnil(L);
+    }
+
+    return 1;
+}
+
+static int
+vk_mirror_gc(lua_State *L) {
+    struct vk_mirror **mirror = lua_touserdata(L, 1);
+
+    if (*mirror) {
+        struct config_vm *vm = config_vm_from(L);
+        struct wrap *wrap = config_vm_get_wrap(vm);
+        if (wrap && wrap->vk) {
+            server_vk_remove_mirror(wrap->vk, *mirror);
+        }
+    }
+    *mirror = NULL;
+
+    return 0;
+}
+
+static int
+vk_image_close(lua_State *L) {
+    struct vk_image **image = lua_touserdata(L, 1);
+
+    if (!*image) {
+        return luaL_error(L, "cannot close image more than once");
+    }
+
+    struct config_vm *vm = config_vm_from(L);
+    struct wrap *wrap = config_vm_get_wrap(vm);
+    if (wrap && wrap->vk) {
+        server_vk_remove_image(wrap->vk, *image);
+    }
+    *image = NULL;
+
+    return 0;
+}
+
+static int
+vk_image_show(lua_State *L) {
+    struct vk_image **image = lua_touserdata(L, 1);
+    if (*image) {
+        server_vk_image_set_enabled(*image, true);
+    }
+    return 0;
+}
+
+static int
+vk_image_hide(lua_State *L) {
+    struct vk_image **image = lua_touserdata(L, 1);
+    if (*image) {
+        server_vk_image_set_enabled(*image, false);
+    }
+    return 0;
+}
+
+static int
+vk_image_index(lua_State *L) {
+    const char *key = luaL_checkstring(L, 2);
+
+    if (strcmp(key, "close") == 0) {
+        lua_pushcfunction(L, vk_image_close);
+    } else if (strcmp(key, "show") == 0) {
+        lua_pushcfunction(L, vk_image_show);
+    } else if (strcmp(key, "hide") == 0) {
+        lua_pushcfunction(L, vk_image_hide);
+    } else {
+        lua_pushnil(L);
+    }
+
+    return 1;
+}
+
+static int
+vk_image_gc(lua_State *L) {
+    struct vk_image **image = lua_touserdata(L, 1);
+
+    if (*image) {
+        struct config_vm *vm = config_vm_from(L);
+        struct wrap *wrap = config_vm_get_wrap(vm);
+        if (wrap && wrap->vk) {
+            server_vk_remove_image(wrap->vk, *image);
+        }
+    }
+    *image = NULL;
+
+    return 0;
+}
+
+static int
+vk_text_close(lua_State *L) {
+    struct vk_text **text = lua_touserdata(L, 1);
+
+    if (!*text) {
+        return luaL_error(L, "cannot close text more than once");
+    }
+
+    struct config_vm *vm = config_vm_from(L);
+    struct wrap *wrap = config_vm_get_wrap(vm);
+    if (wrap && wrap->vk) {
+        server_vk_remove_text(wrap->vk, *text);
+    }
+    *text = NULL;
+
+    return 0;
+}
+
+static int
+vk_text_show(lua_State *L) {
+    struct vk_text **text = lua_touserdata(L, 1);
+    if (*text) {
+        server_vk_text_set_enabled(*text, true);
+    }
+    return 0;
+}
+
+static int
+vk_text_hide(lua_State *L) {
+    struct vk_text **text = lua_touserdata(L, 1);
+    if (*text) {
+        server_vk_text_set_enabled(*text, false);
+    }
+    return 0;
+}
+
+// Helper to parse color string "#RRGGBBAA" or "#RRGGBB"
+static uint32_t
+parse_color_string(const char *str) {
+    if (!str || str[0] != '#') return 0xFFFFFFFF;
+
+    uint32_t color = 0;
+    int len = strlen(str);
+
+    if (len == 9) {  // #RRGGBBAA
+        for (int i = 1; i < 9; i++) {
+            char c = str[i];
+            int val = 0;
+            if (c >= '0' && c <= '9') val = c - '0';
+            else if (c >= 'a' && c <= 'f') val = 10 + c - 'a';
+            else if (c >= 'A' && c <= 'F') val = 10 + c - 'A';
+            color = (color << 4) | val;
+        }
+    } else if (len == 7) {  // #RRGGBB (assume alpha = FF)
+        for (int i = 1; i < 7; i++) {
+            char c = str[i];
+            int val = 0;
+            if (c >= '0' && c <= '9') val = c - '0';
+            else if (c >= 'a' && c <= 'f') val = 10 + c - 'a';
+            else if (c >= 'A' && c <= 'F') val = 10 + c - 'A';
+            color = (color << 4) | val;
+        }
+        color = (color << 8) | 0xFF;
+    } else {
+        return 0xFFFFFFFF;
+    }
+
+    return color;
+}
+
+static int
+vk_text_set_text(lua_State *L) {
+    struct vk_text **text = lua_touserdata(L, 1);
+    const char *new_text = luaL_checkstring(L, 2);
+
+    if (*text) {
+        server_vk_text_set_text(*text, new_text);
+    }
+    return 0;
+}
+
+static int
+vk_text_set_color(lua_State *L) {
+    struct vk_text **text = lua_touserdata(L, 1);
+    const char *color_str = luaL_checkstring(L, 2);
+
+    if (*text) {
+        uint32_t color = parse_color_string(color_str);
+        server_vk_text_set_color(*text, color);
+    }
+    return 0;
+}
+
+static int
+vk_text_index(lua_State *L) {
+    const char *key = luaL_checkstring(L, 2);
+
+    if (strcmp(key, "close") == 0) {
+        lua_pushcfunction(L, vk_text_close);
+    } else if (strcmp(key, "show") == 0) {
+        lua_pushcfunction(L, vk_text_show);
+    } else if (strcmp(key, "hide") == 0) {
+        lua_pushcfunction(L, vk_text_hide);
+    } else if (strcmp(key, "set_text") == 0) {
+        lua_pushcfunction(L, vk_text_set_text);
+    } else if (strcmp(key, "set_color") == 0) {
+        lua_pushcfunction(L, vk_text_set_color);
+    } else {
+        lua_pushnil(L);
+    }
+
+    return 1;
+}
+
+static int
+vk_text_gc(lua_State *L) {
+    struct vk_text **text = lua_touserdata(L, 1);
+
+    if (*text) {
+        struct config_vm *vm = config_vm_from(L);
+        struct wrap *wrap = config_vm_get_wrap(vm);
+        if (wrap && wrap->vk) {
+            server_vk_remove_text(wrap->vk, *text);
+        }
+    }
+    *text = NULL;
 
     return 0;
 }
@@ -425,6 +702,7 @@ atlas_raw(lua_State *L) {
 
     struct config_vm *vm = config_vm_from(L);
     struct wrap *wrap = config_vm_get_wrap(vm);
+    CHECK_SCENE(wrap, L);
     struct Custom_atlas **atlas = lua_touserdata(L, 1);
 
     size_t data_size;
@@ -443,6 +721,7 @@ atlas_get_raw(lua_State *L) {
 
     struct config_vm *vm = config_vm_from(L);
     struct wrap *wrap = config_vm_get_wrap(vm);
+    CHECK_SCENE(wrap, L);
     struct Custom_atlas **atlas = lua_touserdata(L, 1);
 
     size_t data_size;
@@ -697,6 +976,32 @@ l_image(lua_State *L) {
     luaL_checktype(L, ARG_OPTIONS, LUA_TTABLE);
     lua_settop(L, ARG_OPTIONS);
 
+    // In Vulkan-only mode, use Vulkan images
+    if (!wrap->scene && wrap->vk) {
+        struct vk_image_options vk_options = {0};
+        unmarshal_box_key(L, "dst", &vk_options.dst);
+
+        // Body - create Vulkan image
+        struct vk_image **image = lua_newuserdata(L, sizeof(*image));
+        check_alloc(image);
+
+        luaL_getmetatable(L, METATABLE_VK_IMAGE);
+        lua_setmetatable(L, -2);
+
+        *image = server_vk_add_image(wrap->vk, path, &vk_options);
+        if (!*image) {
+            return luaL_error(L, "failed to create Vulkan image from PNG at '%s'", path);
+        }
+
+        return 1;
+    }
+
+    // Scene mode - use OpenGL images
+    if (!wrap->scene) {
+        lua_pushnil(L);
+        return 1;
+    }
+
     struct scene_image_options options = {0};
     unmarshal_box_key(L, "dst", &options.dst);
 
@@ -742,6 +1047,11 @@ l_image_from_atlas(lua_State *L) {
     struct wrap *wrap = config_vm_get_wrap(vm);
     if (!wrap) {
         return luaL_error(L, STARTUP_ERRMSG("image"));
+    }
+    // In Vulkan-only mode, images aren't supported yet - return nil instead of erroring
+    if (!wrap->scene) {
+        lua_pushnil(L);
+        return 1;
     }
 
     struct scene_image_from_atlas_options options = {0};
@@ -800,6 +1110,11 @@ l_animated_image(lua_State *L) {
     if (!wrap) {
         return luaL_error(L, STARTUP_ERRMSG("animated_image"));
     }
+    // In Vulkan-only mode, animated images aren't supported yet - return nil
+    if (!wrap->scene) {
+        lua_pushnil(L);
+        return 1;
+    }
 
     const char *path = luaL_checkstring(L, ARG_PATH);
     luaL_checktype(L, ARG_OPTIONS, LUA_TTABLE);
@@ -854,6 +1169,52 @@ l_mirror(lua_State *L) {
 
     luaL_checktype(L, ARG_OPTIONS, LUA_TTABLE);
     lua_settop(L, ARG_OPTIONS);
+
+    // Use Vulkan backend if available
+    if (wrap->vk) {
+        struct vk_mirror_options options = {0};
+
+        unmarshal_box_key(L, "src", &options.src);
+        unmarshal_box_key(L, "dst", &options.dst);
+
+        lua_pushstring(L, "color_key"); // stack: 2
+        lua_rawget(L, ARG_OPTIONS);     // stack: 2
+
+        if (lua_type(L, -1) == LUA_TTABLE) {
+            float src_rgba[4] = {0};
+            float dst_rgba[4] = {0};
+            unmarshal_color(L, "input", src_rgba);
+            unmarshal_color(L, "output", dst_rgba);
+
+            options.color_key_enabled = true;
+            // Convert float RGB to uint32_t 0xRRGGBB
+            options.color_key_input = ((uint32_t)(src_rgba[0] * 255.0f) << 16) |
+                                      ((uint32_t)(src_rgba[1] * 255.0f) << 8) |
+                                      ((uint32_t)(src_rgba[2] * 255.0f));
+            options.color_key_output = ((uint32_t)(dst_rgba[0] * 255.0f) << 16) |
+                                       ((uint32_t)(dst_rgba[1] * 255.0f) << 8) |
+                                       ((uint32_t)(dst_rgba[2] * 255.0f));
+            options.color_key_tolerance = 0.1f;  // Default tolerance
+        }
+        lua_pop(L, 1); // stack: 1
+
+        // Body
+        struct vk_mirror **mirror = lua_newuserdata(L, sizeof(*mirror));
+        check_alloc(mirror);
+
+        luaL_getmetatable(L, METATABLE_VK_MIRROR);
+        lua_setmetatable(L, -2);
+
+        *mirror = server_vk_add_mirror(wrap->vk, &options);
+        if (!*mirror) {
+            return luaL_error(L, "failed to create Vulkan mirror");
+        }
+
+        return 1;
+    }
+
+    // Fall back to scene mirrors if no Vulkan
+    CHECK_SCENE(wrap, L);
 
     struct scene_mirror_options options = {0};
 
@@ -1335,6 +1696,67 @@ l_text(lua_State *L) {
     }
 
     const char *data = luaL_checkstring(L, ARG_TEXT);
+    lua_settop(L, ARG_OPTIONS);
+
+    // In Vulkan-only mode, use Vulkan text
+    if (!wrap->scene && wrap->vk) {
+        struct vk_text_options vk_options = {0};
+
+        lua_pushstring(L, "x");
+        lua_rawget(L, ARG_OPTIONS);
+        if (lua_type(L, -1) == LUA_TNUMBER) {
+            vk_options.x = lua_tointeger(L, -1);
+        }
+        lua_pop(L, 1);
+
+        lua_pushstring(L, "y");
+        lua_rawget(L, ARG_OPTIONS);
+        if (lua_type(L, -1) == LUA_TNUMBER) {
+            vk_options.y = lua_tointeger(L, -1);
+        }
+        lua_pop(L, 1);
+
+        lua_pushstring(L, "size");
+        lua_rawget(L, ARG_OPTIONS);
+        if (lua_type(L, -1) == LUA_TNUMBER) {
+            vk_options.size = lua_tointeger(L, -1);
+        } else {
+            vk_options.size = 1;
+        }
+        lua_pop(L, 1);
+
+        lua_pushstring(L, "color");
+        lua_rawget(L, ARG_OPTIONS);
+        if (lua_type(L, -1) == LUA_TSTRING) {
+            vk_options.color = parse_color_string(lua_tostring(L, -1));
+        } else {
+            vk_options.color = 0xFFFFFFFF;  // Default white
+        }
+        lua_pop(L, 1);
+
+        // Body - create Vulkan text
+        struct vk_text **text = lua_newuserdata(L, sizeof(*text));
+        check_alloc(text);
+
+        luaL_getmetatable(L, METATABLE_VK_TEXT);
+        lua_setmetatable(L, -2);
+
+        *text = server_vk_add_text(wrap->vk, data, &vk_options);
+        if (!*text) {
+            return luaL_error(L, "failed to create Vulkan text");
+        }
+
+        return 1;
+    }
+
+    // Scene mode disabled - return nil
+    if (!wrap->scene) {
+        lua_pushnil(L);
+        return 1;
+    }
+
+    // Scene mode - use OpenGL text
+    // (stack already has ARG_OPTIONS at top from lua_settop above)
 
     lua_settop(L, ARG_OPTIONS);
 
@@ -1417,6 +1839,15 @@ l_text_advance(lua_State *L) {
     struct wrap *wrap = config_vm_get_wrap(vm);
     if (!wrap) {
         return luaL_error(L, STARTUP_ERRMSG("text"));
+    }
+    // In Vulkan-only mode, text_advance isn't supported yet - return {x=0, y=0}
+    if (!wrap->scene) {
+        lua_newtable(L);
+        lua_pushinteger(L, 0);
+        lua_setfield(L, -2, "x");
+        lua_pushinteger(L, 0);
+        lua_setfield(L, -2, "y");
+        return 1;
     }
 
     size_t data_size = 0;
@@ -1595,6 +2026,11 @@ l_atlas(lua_State *L) {
     if (!wrap) {
         return luaL_error(L, STARTUP_ERRMSG("atlas"));
     }
+    // In Vulkan-only mode, atlas isn't supported yet - return nil
+    if (!wrap->scene) {
+        lua_pushnil(L);
+        return 1;
+    }
 
     const int width = luaL_checkinteger(L, ARG_WIDTH);
 
@@ -1677,6 +2113,26 @@ config_api_init(struct config_vm *vm) {
     lua_pushcfunction(vm->L, mirror_index);     // stack: n+3
     lua_settable(vm->L, -3);                    // stack: n+1
     lua_pop(vm->L, 1);                          // stack: n
+
+    // Create the metatable for Vulkan "mirror" objects.
+    luaL_newmetatable(vm->L, METATABLE_VK_MIRROR); // stack: n+1
+    lua_pushstring(vm->L, "__gc");                 // stack: n+2
+    lua_pushcfunction(vm->L, vk_mirror_gc);        // stack: n+3
+    lua_settable(vm->L, -3);                       // stack: n+1
+    lua_pushstring(vm->L, "__index");              // stack: n+2
+    lua_pushcfunction(vm->L, vk_mirror_index);     // stack: n+3
+    lua_settable(vm->L, -3);                       // stack: n+1
+    lua_pop(vm->L, 1);                             // stack: n
+
+    // Create the metatable for Vulkan "image" objects.
+    luaL_newmetatable(vm->L, METATABLE_VK_IMAGE);  // stack: n+1
+    lua_pushstring(vm->L, "__gc");                 // stack: n+2
+    lua_pushcfunction(vm->L, vk_image_gc);         // stack: n+3
+    lua_settable(vm->L, -3);                       // stack: n+1
+    lua_pushstring(vm->L, "__index");              // stack: n+2
+    lua_pushcfunction(vm->L, vk_image_index);      // stack: n+3
+    lua_settable(vm->L, -3);                       // stack: n+1
+    lua_pop(vm->L, 1);                             // stack: n
 
     // Create the metatable for "text" objects.
     luaL_newmetatable(vm->L, METATABLE_TEXT); // stack: n+1

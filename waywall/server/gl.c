@@ -115,20 +115,11 @@ struct gl_buffer {
     struct server_gl *gl;
 
     struct server_buffer *parent;
-    EGLImageKHR image; // imported DMABUF - must not be modified (NULL for CPU-copied buffers)
-    GLuint texture;    // must not be modified
+    EGLImageKHR image;   // imported DMABUF
+    GLuint texture;
 
-    struct gbm_bo *gbm_bo;
-
-    // For CPU-copied cross-GPU buffers
-    bool cpu_copied;           // true if this buffer was created via CPU copy
-    void *cpu_map;             // mmap'd dmabuf data (for CPU copy path)
-    size_t cpu_map_size;       // size of mmap
-    int32_t width, height;     // buffer dimensions
-    uint32_t stride;           // buffer stride
-    GLenum gl_format;          // GL format for texture upload
-    GLenum gl_type;            // GL type for texture upload
-    int dmabuf_fd;             // dmabuf fd for sync operations
+    struct gbm_bo *gbm_bo;  // GBM buffer object for cross-GPU import
+    int dmabuf_fd;          // dmabuf fd for cross-GPU sync operations
 };
 
 // clang-format off
@@ -203,6 +194,7 @@ static bool gl_checkerr(const char *msg);
 static void gl_buffer_destroy(struct gl_buffer *gl_buffer);
 static struct gl_buffer *gl_buffer_import(struct server_gl *gl, struct server_buffer *buffer);
 
+
 // Sync dmabuf for CPU read - ensures GPU writes are visible
 static void
 dmabuf_sync_start_read(int fd) {
@@ -224,32 +216,6 @@ dmabuf_sync_end_read(int fd) {
     }
 }
 
-// Update texture data for CPU-copied buffers (needed because the dmabuf contents change each frame)
-static void
-gl_buffer_update_cpu(struct gl_buffer *gl_buffer) {
-    if (!gl_buffer->cpu_copied || !gl_buffer->cpu_map) {
-        return;
-    }
-
-    // Sync dmabuf to ensure GPU writes are visible to CPU
-    dmabuf_sync_start_read(gl_buffer->dmabuf_fd);
-
-    // Make EGL context current
-    if (!eglMakeCurrent(gl_buffer->gl->egl.display, EGL_NO_SURFACE, EGL_NO_SURFACE,
-                        gl_buffer->gl->egl.ctx)) {
-        ww_log_egl(LOG_ERROR, "CPU copy update: failed to make EGL context current");
-        return;
-    }
-
-    // Re-upload texture data from the mmap'd dmabuf
-    gl_using_texture(GL_TEXTURE_2D, gl_buffer->texture) {
-        glPixelStorei(GL_UNPACK_ROW_LENGTH_EXT, gl_buffer->stride / 4);
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, gl_buffer->width, gl_buffer->height,
-                        gl_buffer->gl_format, gl_buffer->gl_type, gl_buffer->cpu_map);
-        glPixelStorei(GL_UNPACK_ROW_LENGTH_EXT, 0);
-    }
-}
-
 static void
 on_surface_commit(struct wl_listener *listener, void *data) {
     struct server_gl *gl = wl_container_of(listener, gl, on_surface_commit);
@@ -266,9 +232,10 @@ on_surface_commit(struct wl_listener *listener, void *data) {
     struct gl_buffer *gl_buffer;
     wl_list_for_each (gl_buffer, &gl->capture.buffers, link) {
         if (gl_buffer->parent == buffer) {
-            // For CPU-copied buffers, we need to re-upload the texture data
-            // because the dmabuf contents change each frame
-            gl_buffer_update_cpu(gl_buffer);
+            // Cross-GPU sync: ensure memory coherency before reading
+            if (gl_buffer->dmabuf_fd >= 0) {
+                dmabuf_sync_start_read(gl_buffer->dmabuf_fd);
+            }
             gl->capture.current = gl_buffer;
             return;
         }
@@ -415,148 +382,15 @@ gl_buffer_destroy(struct gl_buffer *gl_buffer) {
 
     glDeleteTextures(1, &gl_buffer->texture);
 
-    if (gl_buffer->cpu_copied) {
-        // CPU-copied buffer - unmap memory
-        if (gl_buffer->cpu_map) {
-            munmap(gl_buffer->cpu_map, gl_buffer->cpu_map_size);
-        }
-    } else {
-        if (gl_buffer->image) {
-            // EGL-imported buffer - destroy EGL image
-            gl_buffer->gl->egl.DestroyImageKHR(gl_buffer->gl->egl.display, gl_buffer->image);
-        }
-        if (gl_buffer->gbm_bo) {
-            gbm_bo_destroy(gl_buffer->gbm_bo);
-        }
+    if (gl_buffer->image) {
+        gl_buffer->gl->egl.DestroyImageKHR(gl_buffer->gl->egl.display, gl_buffer->image);
+    }
+    if (gl_buffer->gbm_bo) {
+        gbm_bo_destroy(gl_buffer->gbm_bo);
     }
 
     wl_list_remove(&gl_buffer->link);
     free(gl_buffer);
-}
-
-// Try to import a dmabuf via CPU copy (fallback for cross-GPU buffers)
-static struct gl_buffer *
-gl_buffer_import_cpu(struct server_gl *gl, struct server_buffer *buffer) {
-    struct server_dmabuf_data *data = buffer->data;
-
-    // Only support single-plane LINEAR buffers for CPU copy
-    if (data->num_planes != 1) {
-        ww_log(LOG_WARN, "CPU copy fallback only supports single-plane buffers (got %d planes)",
-               data->num_planes);
-        return NULL;
-    }
-
-    uint64_t modifier = ((uint64_t)data->modifier_hi << 32) | data->modifier_lo;
-    if (modifier != 0 && modifier != DRM_FORMAT_MOD_INVALID) {
-        ww_log(LOG_WARN, "CPU copy fallback only supports LINEAR modifier (got 0x%llx)",
-               (unsigned long long)modifier);
-        return NULL;
-    }
-
-    // Determine GL format based on DRM format
-    GLenum gl_format = GL_RGBA;
-    GLenum gl_type = GL_UNSIGNED_BYTE;
-    int bpp = 4;
-
-    switch (data->format) {
-    case 0x34325258: // DRM_FORMAT_XRGB8888
-    case 0x34325241: // DRM_FORMAT_ARGB8888
-        gl_format = GL_BGRA_EXT;
-        gl_type = GL_UNSIGNED_BYTE;
-        bpp = 4;
-        break;
-    case 0x34324258: // DRM_FORMAT_XBGR8888
-    case 0x34324241: // DRM_FORMAT_ABGR8888
-        gl_format = GL_RGBA;
-        gl_type = GL_UNSIGNED_BYTE;
-        bpp = 4;
-        break;
-    default:
-        ww_log(LOG_WARN, "CPU copy fallback: unsupported format 0x%x", data->format);
-        return NULL;
-    }
-
-    // Calculate buffer size
-    size_t map_size = data->planes[0].stride * data->height;
-
-    // Start CPU read access
-    struct dma_buf_sync sync_start = { .flags = DMA_BUF_SYNC_READ | DMA_BUF_SYNC_START };
-    if (ioctl(data->planes[0].fd, DMA_BUF_IOCTL_SYNC, &sync_start) != 0) {
-        ww_log(LOG_WARN, "CPU copy fallback: dmabuf sync start failed: %s", strerror(errno));
-    }
-
-    // mmap the dmabuf
-    void *map = mmap(NULL, map_size, PROT_READ, MAP_SHARED,
-                     data->planes[0].fd, data->planes[0].offset);
-    if (map == MAP_FAILED) {
-        ww_log(LOG_ERROR, "CPU copy fallback: failed to mmap dmabuf fd %d: %s",
-               data->planes[0].fd, strerror(errno));
-        // End sync if mmap failed
-        struct dma_buf_sync sync_end = { .flags = DMA_BUF_SYNC_READ | DMA_BUF_SYNC_END };
-        ioctl(data->planes[0].fd, DMA_BUF_IOCTL_SYNC, &sync_end);
-        return NULL;
-    }
-
-    // ww_log(LOG_INFO, "CPU copy fallback: mmap'd dmabuf %dx%d, stride=%d, format=0x%x",
-    //        data->width, data->height, data->planes[0].stride, data->format);
-
-    // Make EGL context current
-    if (!eglMakeCurrent(gl->egl.display, EGL_NO_SURFACE, EGL_NO_SURFACE, gl->egl.ctx)) {
-        ww_log_egl(LOG_ERROR, "CPU copy fallback: failed to make EGL context current");
-        munmap(map, map_size);
-        struct dma_buf_sync sync_end = { .flags = DMA_BUF_SYNC_READ | DMA_BUF_SYNC_END };
-        ioctl(data->planes[0].fd, DMA_BUF_IOCTL_SYNC, &sync_end);
-        return NULL;
-    }
-
-    // Create gl_buffer structure
-    struct gl_buffer *gl_buffer = zalloc(1, sizeof(*gl_buffer));
-    gl_buffer->gl = gl;
-    gl_buffer->parent = server_buffer_ref(buffer);
-    gl_buffer->cpu_copied = true;
-    gl_buffer->cpu_map = map;
-    gl_buffer->cpu_map_size = map_size;
-    gl_buffer->width = data->width;
-    gl_buffer->height = data->height;
-    gl_buffer->stride = data->planes[0].stride;
-    gl_buffer->gl_format = gl_format;
-    gl_buffer->gl_type = gl_type;
-    gl_buffer->image = EGL_NO_IMAGE_KHR;
-    gl_buffer->dmabuf_fd = data->planes[0].fd;
-
-    // Create OpenGL texture and upload pixel data
-    glGenTextures(1, &gl_buffer->texture);
-    gl_using_texture(GL_TEXTURE_2D, gl_buffer->texture) {
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-
-        // Handle stride mismatch - need row-by-row upload if stride != width * bpp
-        glPixelStorei(GL_UNPACK_ROW_LENGTH_EXT, data->planes[0].stride / bpp);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, data->width, data->height, 0,
-                     gl_format, gl_type, map);
-        glPixelStorei(GL_UNPACK_ROW_LENGTH_EXT, 0);
-
-        if (!gl_checkerr("CPU copy fallback: failed to upload texture")) {
-            glDeleteTextures(1, &gl_buffer->texture);
-            munmap(map, map_size);
-            struct dma_buf_sync sync_end = { .flags = DMA_BUF_SYNC_READ | DMA_BUF_SYNC_END };
-            ioctl(data->planes[0].fd, DMA_BUF_IOCTL_SYNC, &sync_end);
-            server_buffer_unref(gl_buffer->parent);
-            free(gl_buffer);
-            return NULL;
-        }
-    }
-
-    // End CPU read access
-    struct dma_buf_sync sync_end = { .flags = DMA_BUF_SYNC_READ | DMA_BUF_SYNC_END };
-    ioctl(data->planes[0].fd, DMA_BUF_IOCTL_SYNC, &sync_end);
-
-    wl_list_insert(&gl->capture.buffers, &gl_buffer->link);
-
-    // ww_log(LOG_INFO, "CPU copy fallback: successfully created texture for cross-GPU buffer");
-    return gl_buffer;
 }
 
 static struct gl_buffer *
@@ -568,16 +402,12 @@ gl_buffer_import(struct server_gl *gl, struct server_buffer *buffer) {
 
     struct gl_buffer *gl_buffer = zalloc(1, sizeof(*gl_buffer));
     gl_buffer->gl = gl;
-    gl_buffer->cpu_copied = false;
+    gl_buffer->dmabuf_fd = -1;  // Initialize to invalid fd
 
     gl_buffer->parent = server_buffer_ref(buffer);
 
     // Attempt to create an EGLImageKHR for the given DMABUF.
     struct server_dmabuf_data *data = buffer->data;
-
-    uint64_t mod = ((uint64_t)data->modifier_hi << 32) | data->modifier_lo;
-    // ww_log(LOG_INFO, "Importing DMABUF: %dx%d, fmt=0x%x (%.4s), planes=%d, mod=0x%llx", 
-    //        data->width, data->height, data->format, (char*)&data->format, data->num_planes, (unsigned long long)mod);
 
     bool has_modifier = (data->modifier_lo != (DRM_FORMAT_MOD_INVALID & 0xFFFFFFFF) ||
                          data->modifier_hi != ((DRM_FORMAT_MOD_INVALID >> 32) & 0xFFFFFFFF));
@@ -714,6 +544,12 @@ gl_buffer_import(struct server_gl *gl, struct server_buffer *buffer) {
             goto fail_image_target;
         }
     }
+
+    // Store dmabuf fd for cross-GPU sync
+    gl_buffer->dmabuf_fd = data->planes[0].fd;
+
+    // Cross-GPU sync on first import
+    dmabuf_sync_start_read(gl_buffer->dmabuf_fd);
 
     wl_list_insert(&gl->capture.buffers, &gl_buffer->link);
 
@@ -1067,6 +903,11 @@ void
 server_gl_swap_buffers(struct server_gl *gl) {
     eglSwapInterval(gl->egl.display, 0);
     eglSwapBuffers(gl->egl.display, gl->surface.egl);
+
+    // End dma-buf read sync after swap
+    if (gl->capture.current && gl->capture.current->dmabuf_fd >= 0) {
+        dmabuf_sync_end_read(gl->capture.current->dmabuf_fd);
+    }
 }
 
 void

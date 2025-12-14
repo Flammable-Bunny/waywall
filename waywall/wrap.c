@@ -9,6 +9,7 @@
 #include "server/cursor.h"
 #include "server/fake_input.h"
 #include "server/gl.h"
+#include "server/vk.h"
 #include "server/server.h"
 #include "server/ui.h"
 #include "server/wl_compositor.h"
@@ -387,6 +388,11 @@ on_view_create(struct wl_listener *listener, void *data) {
     }
 
     server_gl_set_capture(wrap->gl, view->surface);
+
+    // Also set capture on Vulkan backend for cross-GPU rendering
+    if (wrap->vk) {
+        server_vk_set_capture(wrap->vk, view->surface);
+    }
 }
 
 static void
@@ -547,6 +553,14 @@ wrap_create(struct server *server, struct inotify *inotify, struct ww_timer *tim
         goto fail_gl;
     }
 
+    // Create Vulkan backend for cross-GPU sync (optional, continues without it)
+    wrap->vk = server_vk_create(server, cfg->experimental.dual_gpu);
+    if (wrap->vk) {
+        ww_log(LOG_INFO, "Vulkan backend initialized for cross-GPU sync");
+    } else {
+        ww_log(LOG_WARN, "Vulkan backend not available, using GL only");
+    }
+
     wrap->scene = scene_create(cfg, wrap->gl, server->ui);
     if (!wrap->scene) {
         ww_log(LOG_ERROR, "failed to create scene");
@@ -586,6 +600,9 @@ wrap_create(struct server *server, struct inotify *inotify, struct ww_timer *tim
     return wrap;
 
 fail_scene:
+    if (wrap->vk) {
+        server_vk_destroy(wrap->vk);
+    }
     server_gl_destroy(wrap->gl);
 
 fail_gl:
@@ -601,6 +618,9 @@ wrap_destroy(struct wrap *wrap) {
     }
 
     scene_destroy(wrap->scene);
+    if (wrap->vk) {
+        server_vk_destroy(wrap->vk);
+    }
     server_gl_destroy(wrap->gl);
 
     subproc_destroy(wrap->subproc);

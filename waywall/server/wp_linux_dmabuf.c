@@ -104,26 +104,21 @@ create_buffer(struct server_linux_buffer_params *buffer_params, struct wl_resour
     buffer_params->data->format = format;
     buffer_params->data->flags = flags;
 
-    // Always proxy dmabuf to parent compositor (Hyprland).
-    // Hyprland handles cross-GPU buffer import directly via its own mechanisms.
-    // This allows GPU-to-GPU VRAM transfers without CPU involvement.
-    zwp_linux_buffer_params_v1_create(buffer_params->remote, width, height, format, flags);
-    wl_display_roundtrip_queue(buffer_params->parent->remote_display, buffer_params->parent->queue);
+    // For cross-GPU scenarios, create buffer locally without forwarding to parent compositor.
+    // The Vulkan backend will import the dma-buf directly using VK_EXT_external_memory_dma_buf.
+    // This avoids the cross-GPU import failure on the host compositor side.
+    //
+    // We create a "local-only" buffer that stores the dma-buf data but doesn't have a
+    // corresponding wl_buffer on the parent compositor. The Vulkan backend handles rendering.
+    ww_log(LOG_INFO, "creating local-only dmabuf: %dx%d, format=0x%x, modifier=0x%llx",
+           width, height, format,
+           (unsigned long long)(((uint64_t)buffer_params->data->modifier_hi << 32) |
+                                buffer_params->data->modifier_lo));
 
-    // The event listeners on the buffer params object will set `buffer_params->status`.
-    switch (buffer_params->status) {
-    case BUFFER_PARAMS_STATUS_UNKNOWN:
-        wl_client_post_implementation_error(
-            wl_resource_get_client(buffer_resource),
-            "remote compositor failed to signal status of DMABUF buffer creation");
-        break;
-    case BUFFER_PARAMS_STATUS_OK:
-        buffer_params->buffer = server_buffer_create(buffer_resource, buffer_params->ok_buffer,
-                                                     &dmabuf_buffer_impl, buffer_params->data);
-        break;
-    case BUFFER_PARAMS_STATUS_NOT_OK:
-        break;
-    }
+    // Create server_buffer with NULL remote buffer - this marks it as local-only
+    buffer_params->buffer = server_buffer_create(buffer_resource, NULL,
+                                                 &dmabuf_buffer_impl, buffer_params->data);
+    buffer_params->status = BUFFER_PARAMS_STATUS_OK;
 }
 
 static void

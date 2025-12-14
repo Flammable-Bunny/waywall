@@ -35,7 +35,7 @@ on_global_bind(struct wl_client *client, void *data, uint32_t version, uint32_t 
 
     wl_output_send_geometry(resource, 0, 0, 0, 0, WL_OUTPUT_SUBPIXEL_UNKNOWN, "waywall", "waywall",
                             WL_OUTPUT_TRANSFORM_NORMAL);
-    wl_output_send_mode(resource, WL_OUTPUT_MODE_CURRENT, output->ui->width, output->ui->height, 0);
+    wl_output_send_mode(resource, WL_OUTPUT_MODE_CURRENT, output->ui->width, output->ui->height, 60000);
 
     if (version >= WL_OUTPUT_NAME_SINCE_VERSION) {
         wl_output_send_name(resource, "waywall output");
@@ -54,7 +54,7 @@ on_resize(struct wl_listener *listener, void *data) {
     struct wl_resource *output_resource, *tmp;
     wl_resource_for_each_safe(output_resource, tmp, &output->objects) {
         wl_output_send_mode(output_resource, WL_OUTPUT_MODE_CURRENT, output->ui->width,
-                            output->ui->height, 0);
+                            output->ui->height, 60000);
 
         if (wl_resource_get_version(output_resource) >= WL_OUTPUT_DONE_SINCE_VERSION) {
             wl_output_send_done(output_resource);

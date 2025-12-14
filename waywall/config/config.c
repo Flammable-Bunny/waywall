@@ -24,9 +24,10 @@ static const struct config defaults = {
         {
             .debug = false,
             .jit = false,
-            .tearing = false,
+            .tearing = true,
             .no_dmabuf = false,
             .force_composition = true,
+            .dual_gpu = false,
             .subprocess_dri_prime = NULL,
         },
     .input =
@@ -485,6 +486,10 @@ process_config_experimental(struct config *cfg) {
     }
 
     if (get_bool(cfg, "force_composition", &cfg->experimental.force_composition, "experimental.force_composition", false) != 0) {
+        return 1;
+    }
+
+    if (get_bool(cfg, "dual_gpu", &cfg->experimental.dual_gpu, "experimental.dual_gpu", false) != 0) {
         return 1;
     }
 

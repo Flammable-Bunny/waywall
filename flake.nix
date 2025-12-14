@@ -33,10 +33,14 @@
           wayland-protocols
           wayland-scanner
           libxkbcommon
-          # EGL/GL
+          # EGL/GL/Vulkan
           libGL
           mesa
           libgbm
+          vulkan-loader
+          vulkan-headers
+          shaderc
+          libdrm
           # XCB dependencies
           xorg.libxcb
           xorg.xcbutilwm

@@ -1,5 +1,6 @@
 subdir('glsl')
 subdir('lua')
+subdir('shaders')
 
 waywall_src = files(
   'animation.c',
@@ -12,6 +13,7 @@ waywall_src = files(
   'server/cursor.c',
   'server/fake_input.c',
   'server/gl.c',
+  'server/vk.c',
   'server/server.c',
   'server/ui.c',
   'server/wl_compositor.c',
@@ -54,6 +56,7 @@ executable('waywall',
   waywall_src,
   waywall_glsl,
   waywall_lua,
+  waywall_shaders,
   protocol_headers,
   protocol_sources,
 

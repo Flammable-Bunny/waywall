@@ -65,8 +65,6 @@ handle_selection_pipe(int32_t fd, uint32_t mask, void *data) {
     data_device_manager->selection_content.len = new_len;
 
     if (eof) {
-        ww_log(LOG_INFO, "received selection content of length %lu", strlen(*str));
-
         xwl_set_clipboard(data_device_manager->server->xwayland, *str);
 
         wl_event_source_remove(data_device_manager->selection_content.src_pipe);
@@ -825,6 +823,10 @@ on_display_destroy(struct wl_listener *listener, void *data) {
 
 struct server_data_device_manager *
 server_data_device_manager_create(struct server *server) {
+    if (!server->backend->data_device_manager) {
+        return NULL;
+    }
+
     struct server_data_device_manager *data_device_manager =
         zalloc(1, sizeof(*data_device_manager));
 

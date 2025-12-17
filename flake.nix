@@ -22,6 +22,8 @@
           ninja
           pkg-config
           wayland-scanner
+          gcc
+          clang
         ];
 
         buildInputs = with pkgs; [
@@ -74,6 +76,10 @@
 
       devShells.${system}.default = pkgs.mkShell {
         inputsFrom = [ self.packages.${system}.default ];
+        shellHook = ''
+          export PKG_CONFIG_PATH=${pkgs.libgbm}/lib/pkgconfig:$PKG_CONFIG_PATH
+          export INTEL_DEBUG=noccs
+        '';
       };
     };
 }

@@ -5,6 +5,20 @@
 #include <wayland-server-core.h>
 #include <wayland-util.h>
 
+struct wl_output;
+struct server_backend;
+
+struct server_backend_output {
+    struct wl_list link; // server_backend.outputs
+
+    struct server_backend *backend;
+    uint32_t name; // wl_registry global name
+
+    struct wl_output *remote;
+    int32_t width, height;
+    int32_t refresh_mhz;
+};
+
 struct server_backend {
     struct wl_display *display;
     struct wl_registry *registry;
@@ -20,6 +34,10 @@ struct server_backend {
         struct wl_pointer *pointer;
     } seat;
     struct wl_array shm_formats; // data: uint32_t
+
+    // host outputs (used for advertising wl_output refresh to clients)
+    struct wl_list outputs; // server_backend_output.link
+    int32_t preferred_refresh_mhz;
 
     // mandatory globals
     struct wl_compositor *compositor;
@@ -50,5 +68,8 @@ struct server_backend {
 
 struct server_backend *server_backend_create();
 void server_backend_destroy(struct server_backend *backend);
+
+int32_t server_backend_preferred_refresh_mhz(struct server_backend *backend);
+int32_t server_backend_output_refresh_mhz(struct server_backend *backend, struct wl_output *output);
 
 #endif

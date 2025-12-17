@@ -1,0 +1,1 @@
+/nix/store/q8fd7g3rm3yqc3z9d0rgji3m35h6mq8f-home-manager-files/.config/waywall/dkjson.lua

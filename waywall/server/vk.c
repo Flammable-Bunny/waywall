@@ -10,6 +10,7 @@
 #include "server/wp_linux_drm_syncobj.h"
 #include "server/wp_linux_dmabuf.h"
 #include "util/alloc.h"
+#include "util/avif.h"
 #include "util/log.h"
 #include "util/png.h"
 #include "util/prelude.h"
@@ -20,6 +21,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <math.h>
+#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -34,9 +37,707 @@ static PFN_vkImportSemaphoreFdKHR pfn_vkImportSemaphoreFdKHR = NULL;
 #include <wayland-client-protocol.h>
 
 #include <drm/drm.h>
+#include <drm/drm_fourcc.h>
 #include <gbm.h>
 #include <linux/dma-buf.h>
 #include <xf86drm.h>
+
+static uint64_t
+now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+static int32_t
+refresh_mhz_to_ms(int32_t refresh_mhz) {
+    if (refresh_mhz <= 0) {
+        return 16; // fallback ~60 Hz
+    }
+    // refresh_mhz is milli-Hz, so period_ms = 1e6 / refresh_mhz.
+    int32_t ms = (int32_t)(1000000 / refresh_mhz);
+    if (ms < 1) ms = 1;
+    if (ms > 1000) ms = 1000;
+    return ms;
+}
+
+// Forward decls for helpers used before definition
+static void on_ui_refresh(struct wl_listener *listener, void *data);
+static int handle_overlay_tick(void *data);
+
+// Forward decls for helpers used before definition
+static uint32_t find_memory_type(struct server_vk *vk, uint32_t type_filter, VkMemoryPropertyFlags properties);
+static VkFormat drm_format_to_vk(uint32_t drm_format);
+
+static void
+destroy_double_buffered_optimal(struct server_vk *vk, struct vk_buffer *buf) {
+    for (int i = 0; i < 2; i++) {
+        if (buf->optimal_descriptors[i]) {
+            vkFreeDescriptorSets(vk->device, vk->descriptor_pool, 1, &buf->optimal_descriptors[i]);
+            buf->optimal_descriptors[i] = VK_NULL_HANDLE;
+        }
+        if (buf->optimal_views[i]) {
+            vkDestroyImageView(vk->device, buf->optimal_views[i], NULL);
+            buf->optimal_views[i] = VK_NULL_HANDLE;
+        }
+        if (buf->optimal_images[i]) {
+            vkDestroyImage(vk->device, buf->optimal_images[i], NULL);
+            buf->optimal_images[i] = VK_NULL_HANDLE;
+        }
+        if (buf->optimal_memories[i]) {
+            vkFreeMemory(vk->device, buf->optimal_memories[i], NULL);
+            buf->optimal_memories[i] = VK_NULL_HANDLE;
+        }
+    }
+    if (buf->copy_fence) {
+        vkDestroyFence(vk->device, buf->copy_fence, NULL);
+        buf->copy_fence = VK_NULL_HANDLE;
+    }
+    buf->async_optimal_valid = false;
+    buf->copy_pending = false;
+}
+
+static void
+destroy_optimal_copy(struct server_vk *vk, struct vk_buffer *buf) {
+    if (buf->optimal_view) {
+        vkDestroyImageView(vk->device, buf->optimal_view, NULL);
+        buf->optimal_view = VK_NULL_HANDLE;
+    }
+    if (buf->optimal_image) {
+        vkDestroyImage(vk->device, buf->optimal_image, NULL);
+        buf->optimal_image = VK_NULL_HANDLE;
+    }
+    if (buf->optimal_memory) {
+        vkFreeMemory(vk->device, buf->optimal_memory, NULL);
+        buf->optimal_memory = VK_NULL_HANDLE;
+    }
+    buf->optimal_valid = false;
+}
+
+static bool
+create_optimal_copy(struct server_vk *vk, struct vk_buffer *src_buf) {
+    // Create an optimal-tiling image on AMD and copy from the imported linear image.
+    VkImageCreateInfo img_info = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .imageType = VK_IMAGE_TYPE_2D,
+        .format = src_buf->view ? VK_FORMAT_B8G8R8A8_UNORM : VK_FORMAT_UNDEFINED,
+        .extent = { (uint32_t)src_buf->width, (uint32_t)src_buf->height, 1 },
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+    };
+
+    VkResult res = vkCreateImage(vk->device, &img_info, NULL, &src_buf->optimal_image);
+    if (res != VK_SUCCESS) {
+        return false;
+    }
+
+    VkMemoryRequirements mem_reqs;
+    vkGetImageMemoryRequirements(vk->device, src_buf->optimal_image, &mem_reqs);
+
+    uint32_t mem_type_index = find_memory_type(vk, mem_reqs.memoryTypeBits,
+                                               VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (mem_type_index == UINT32_MAX) {
+        vkDestroyImage(vk->device, src_buf->optimal_image, NULL);
+        src_buf->optimal_image = VK_NULL_HANDLE;
+        return false;
+    }
+
+    VkMemoryAllocateInfo alloc_info = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = mem_reqs.size,
+        .memoryTypeIndex = mem_type_index,
+    };
+
+    res = vkAllocateMemory(vk->device, &alloc_info, NULL, &src_buf->optimal_memory);
+    if (res != VK_SUCCESS) {
+        vkDestroyImage(vk->device, src_buf->optimal_image, NULL);
+        src_buf->optimal_image = VK_NULL_HANDLE;
+        return false;
+    }
+
+    res = vkBindImageMemory(vk->device, src_buf->optimal_image, src_buf->optimal_memory, 0);
+    if (res != VK_SUCCESS) {
+        destroy_optimal_copy(vk, src_buf);
+        return false;
+    }
+
+    VkImageViewCreateInfo view_info = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .image = src_buf->optimal_image,
+        .viewType = VK_IMAGE_VIEW_TYPE_2D,
+        .format = img_info.format,
+        .components = {
+            .r = VK_COMPONENT_SWIZZLE_IDENTITY,
+            .g = VK_COMPONENT_SWIZZLE_IDENTITY,
+            .b = VK_COMPONENT_SWIZZLE_IDENTITY,
+            .a = VK_COMPONENT_SWIZZLE_IDENTITY,
+        },
+        .subresourceRange = {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .baseMipLevel = 0,
+            .levelCount = 1,
+            .baseArrayLayer = 0,
+            .layerCount = 1,
+        },
+    };
+
+    res = vkCreateImageView(vk->device, &view_info, NULL, &src_buf->optimal_view);
+    if (res != VK_SUCCESS) {
+        destroy_optimal_copy(vk, src_buf);
+        return false;
+    }
+
+    src_buf->optimal_valid = true;
+    return true;
+}
+
+static bool
+copy_to_optimal(struct server_vk *vk, struct vk_buffer *buf) {
+    if (!buf->optimal_valid || !buf->optimal_image || !buf->image) {
+        return false;
+    }
+
+    VkCommandBufferAllocateInfo alloc_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = vk->command_pool,
+        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+        .commandBufferCount = 1,
+    };
+
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    if (vkAllocateCommandBuffers(vk->device, &alloc_info, &cmd) != VK_SUCCESS) {
+        return false;
+    }
+
+    VkCommandBufferBeginInfo begin_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
+    vkBeginCommandBuffer(cmd, &begin_info);
+
+    // Transition layouts for copy
+    VkImageMemoryBarrier barriers[2] = {
+        {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = 0,
+            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_PREINITIALIZED,
+            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = buf->image,
+            .subresourceRange = {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .baseMipLevel = 0,
+                .levelCount = 1,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+        },
+        {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = 0,
+            .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = buf->optimal_image,
+            .subresourceRange = {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .baseMipLevel = 0,
+                .levelCount = 1,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+        },
+    };
+
+    vkCmdPipelineBarrier(cmd,
+                         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 0, NULL, 0, NULL, 2, barriers);
+
+    VkImageCopy region = {
+        .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .srcOffset = { 0, 0, 0 },
+        .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .dstOffset = { 0, 0, 0 },
+        .extent = { (uint32_t)buf->width, (uint32_t)buf->height, 1 },
+    };
+    vkCmdCopyImage(cmd,
+                   buf->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                   buf->optimal_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                   1, &region);
+
+    VkImageMemoryBarrier post_barriers[2] = {
+        {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = buf->image,
+            .subresourceRange = {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .baseMipLevel = 0,
+                .levelCount = 1,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+        },
+        {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = buf->optimal_image,
+            .subresourceRange = {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .baseMipLevel = 0,
+                .levelCount = 1,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+        },
+    };
+
+    vkCmdPipelineBarrier(cmd,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                         0, 0, NULL, 0, NULL, 2, post_barriers);
+
+    vkEndCommandBuffer(cmd);
+
+    VkSubmitInfo submit = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &cmd,
+    };
+    VkResult submit_res = vkQueueSubmit(vk->graphics_queue, 1, &submit, VK_NULL_HANDLE);
+    if (submit_res == VK_SUCCESS) {
+        vkQueueWaitIdle(vk->graphics_queue);
+    }
+    vkFreeCommandBuffers(vk->device, vk->command_pool, 1, &cmd);
+
+    return submit_res == VK_SUCCESS;
+}
+
+static bool
+create_double_buffered_optimal(struct server_vk *vk, struct vk_buffer *src_buf) {
+    if (!vk->async_pipelining_enabled) {
+        return false;
+    }
+
+    VkFormat format = src_buf->view ? VK_FORMAT_B8G8R8A8_UNORM : VK_FORMAT_UNDEFINED;
+    if (format == VK_FORMAT_UNDEFINED) {
+        return false;
+    }
+
+    // Create fence for async copy synchronization
+    VkFenceCreateInfo fence_info = {
+        .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+        .flags = VK_FENCE_CREATE_SIGNALED_BIT,  // Start signaled
+    };
+    VkResult res = vkCreateFence(vk->device, &fence_info, NULL, &src_buf->copy_fence);
+    if (res != VK_SUCCESS) {
+        return false;
+    }
+
+    // Create two optimal images for double-buffering
+    for (int i = 0; i < 2; i++) {
+        VkImageCreateInfo img_info = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+            .imageType = VK_IMAGE_TYPE_2D,
+            .format = format,
+            .extent = { (uint32_t)src_buf->width, (uint32_t)src_buf->height, 1 },
+            .mipLevels = 1,
+            .arrayLayers = 1,
+            .samples = VK_SAMPLE_COUNT_1_BIT,
+            .tiling = VK_IMAGE_TILING_OPTIMAL,
+            .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        };
+
+        res = vkCreateImage(vk->device, &img_info, NULL, &src_buf->optimal_images[i]);
+        if (res != VK_SUCCESS) {
+            destroy_double_buffered_optimal(vk, src_buf);
+            return false;
+        }
+
+        VkMemoryRequirements mem_reqs;
+        vkGetImageMemoryRequirements(vk->device, src_buf->optimal_images[i], &mem_reqs);
+
+        uint32_t mem_type_index = find_memory_type(vk, mem_reqs.memoryTypeBits,
+                                                   VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (mem_type_index == UINT32_MAX) {
+            destroy_double_buffered_optimal(vk, src_buf);
+            return false;
+        }
+
+        VkMemoryAllocateInfo alloc_info = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            .allocationSize = mem_reqs.size,
+            .memoryTypeIndex = mem_type_index,
+        };
+
+        res = vkAllocateMemory(vk->device, &alloc_info, NULL, &src_buf->optimal_memories[i]);
+        if (res != VK_SUCCESS) {
+            destroy_double_buffered_optimal(vk, src_buf);
+            return false;
+        }
+
+        res = vkBindImageMemory(vk->device, src_buf->optimal_images[i], src_buf->optimal_memories[i], 0);
+        if (res != VK_SUCCESS) {
+            destroy_double_buffered_optimal(vk, src_buf);
+            return false;
+        }
+
+        VkImageViewCreateInfo view_info = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+            .image = src_buf->optimal_images[i],
+            .viewType = VK_IMAGE_VIEW_TYPE_2D,
+            .format = format,
+            .components = {
+                .r = VK_COMPONENT_SWIZZLE_IDENTITY,
+                .g = VK_COMPONENT_SWIZZLE_IDENTITY,
+                .b = VK_COMPONENT_SWIZZLE_IDENTITY,
+                .a = VK_COMPONENT_SWIZZLE_IDENTITY,
+            },
+            .subresourceRange = {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .baseMipLevel = 0,
+                .levelCount = 1,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+        };
+
+        res = vkCreateImageView(vk->device, &view_info, NULL, &src_buf->optimal_views[i]);
+        if (res != VK_SUCCESS) {
+            destroy_double_buffered_optimal(vk, src_buf);
+            return false;
+        }
+
+        // Allocate descriptor set for this buffer
+        VkDescriptorSetAllocateInfo desc_alloc = {
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .descriptorPool = vk->descriptor_pool,
+            .descriptorSetCount = 1,
+            .pSetLayouts = &vk->blit_pipeline.descriptor_layout,
+        };
+
+        res = vkAllocateDescriptorSets(vk->device, &desc_alloc, &src_buf->optimal_descriptors[i]);
+        if (res != VK_SUCCESS) {
+            destroy_double_buffered_optimal(vk, src_buf);
+            return false;
+        }
+
+        VkDescriptorImageInfo image_desc = {
+            .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            .imageView = src_buf->optimal_views[i],
+            .sampler = vk->sampler,
+        };
+
+        VkWriteDescriptorSet desc_write = {
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = src_buf->optimal_descriptors[i],
+            .dstBinding = 0,
+            .dstArrayElement = 0,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .descriptorCount = 1,
+            .pImageInfo = &image_desc,
+        };
+
+        vkUpdateDescriptorSets(vk->device, 1, &desc_write, 0, NULL);
+    }
+
+    src_buf->optimal_read_index = 0;
+    src_buf->optimal_write_index = 1;
+    src_buf->copy_pending = false;
+    src_buf->async_optimal_valid = true;
+
+    // Note: vk_log not available here, will log in vk_buffer_import
+    return true;
+}
+
+static void
+start_async_copy_to_optimal(struct server_vk *vk, struct vk_buffer *buf) {
+    if (!buf->async_optimal_valid || buf->copy_pending || !buf->image) {
+        return;
+    }
+
+    int write_idx = buf->optimal_write_index;
+
+    // Allocate command buffer from transfer pool
+    VkCommandBufferAllocateInfo alloc_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = vk->transfer_pool,
+        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+        .commandBufferCount = 1,
+    };
+
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    if (vkAllocateCommandBuffers(vk->device, &alloc_info, &cmd) != VK_SUCCESS) {
+        return;
+    }
+
+    VkCommandBufferBeginInfo begin_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
+    vkBeginCommandBuffer(cmd, &begin_info);
+
+    // Transition layouts for copy
+    VkImageMemoryBarrier barriers[2] = {
+        {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = 0,
+            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_PREINITIALIZED,
+            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = buf->image,
+            .subresourceRange = {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .baseMipLevel = 0,
+                .levelCount = 1,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+        },
+        {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = 0,
+            .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = buf->optimal_images[write_idx],
+            .subresourceRange = {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .baseMipLevel = 0,
+                .levelCount = 1,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+        },
+    };
+
+    vkCmdPipelineBarrier(cmd,
+                         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 0, NULL, 0, NULL, 2, barriers);
+
+    VkImageCopy region = {
+        .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .srcOffset = { 0, 0, 0 },
+        .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .dstOffset = { 0, 0, 0 },
+        .extent = { (uint32_t)buf->width, (uint32_t)buf->height, 1 },
+    };
+    vkCmdCopyImage(cmd,
+                   buf->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                   buf->optimal_images[write_idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                   1, &region);
+
+    // Transition to shader read
+    VkImageMemoryBarrier post_barrier = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = buf->optimal_images[write_idx],
+        .subresourceRange = {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .baseMipLevel = 0,
+            .levelCount = 1,
+            .baseArrayLayer = 0,
+            .layerCount = 1,
+        },
+    };
+
+    vkCmdPipelineBarrier(cmd,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                         0, 0, NULL, 0, NULL, 1, &post_barrier);
+
+    vkEndCommandBuffer(cmd);
+
+    // Check if previous copy is done (NON-BLOCKING) - skip if still in progress
+    VkResult fence_status = vkGetFenceStatus(vk->device, buf->copy_fence);
+    if (fence_status != VK_SUCCESS) {
+        // Previous copy still running, skip this one to avoid stalling
+        vkFreeCommandBuffers(vk->device, vk->transfer_pool, 1, &cmd);
+        return;
+    }
+    vkResetFences(vk->device, 1, &buf->copy_fence);
+
+    VkSubmitInfo submit = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &cmd,
+    };
+    VkResult submit_res = vkQueueSubmit(vk->transfer_queue, 1, &submit, buf->copy_fence);
+
+    vkFreeCommandBuffers(vk->device, vk->transfer_pool, 1, &cmd);
+
+    if (submit_res == VK_SUCCESS) {
+        buf->copy_pending = true;
+    }
+}
+
+static void
+try_swap_optimal_buffers(struct server_vk *vk, struct vk_buffer *buf) {
+    if (!buf->async_optimal_valid || !buf->copy_pending) {
+        return;
+    }
+
+    // Check if copy finished (non-blocking)
+    VkResult result = vkGetFenceStatus(vk->device, buf->copy_fence);
+    if (result == VK_SUCCESS) {
+        // Swap indices
+        int tmp = buf->optimal_read_index;
+        buf->optimal_read_index = buf->optimal_write_index;
+        buf->optimal_write_index = tmp;
+
+        // Update descriptor to point to new read buffer
+        buf->descriptor_set = buf->optimal_descriptors[buf->optimal_read_index];
+
+        buf->copy_pending = false;
+    }
+}
+
+static bool
+vk_image_write_rgba(struct server_vk *vk, struct vk_image *image, const unsigned char *rgba, uint32_t width,
+                    uint32_t height) {
+    if (!vk || !vk->device || !image || !image->owns_image || !image->image || !image->memory || !rgba) {
+        return false;
+    }
+    if (width == 0 || height == 0) {
+        return false;
+    }
+
+    VkMemoryRequirements mem_reqs;
+    vkGetImageMemoryRequirements(vk->device, image->image, &mem_reqs);
+
+    void *mapped = NULL;
+    if (vkMapMemory(vk->device, image->memory, 0, mem_reqs.size, 0, &mapped) != VK_SUCCESS) {
+        return false;
+    }
+
+    VkImageSubresource subres = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT};
+    VkSubresourceLayout layout;
+    vkGetImageSubresourceLayout(vk->device, image->image, &subres, &layout);
+
+    const unsigned char *src = rgba;
+    unsigned char *dst = (unsigned char *)mapped + layout.offset;
+    const size_t src_row = (size_t)width * 4;
+
+    for (uint32_t y = 0; y < height; y++) {
+        memcpy(dst, src, src_row);
+        src += src_row;
+        dst += layout.rowPitch;
+    }
+
+    vkUnmapMemory(vk->device, image->memory);
+
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    VkCommandBufferAllocateInfo cmd_alloc = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = vk->command_pool,
+        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+        .commandBufferCount = 1,
+    };
+    if (vkAllocateCommandBuffers(vk->device, &cmd_alloc, &cmd) != VK_SUCCESS) {
+        return false;
+    }
+
+    VkCommandBufferBeginInfo begin_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
+    vkBeginCommandBuffer(cmd, &begin_info);
+
+    VkImageMemoryBarrier barrier = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = image->image,
+        .subresourceRange = {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .baseMipLevel = 0,
+            .levelCount = 1,
+            .baseArrayLayer = 0,
+            .layerCount = 1,
+        },
+        .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+    };
+
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0,
+                         NULL, 1, &barrier);
+    vkEndCommandBuffer(cmd);
+
+    VkSubmitInfo submit = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &cmd,
+    };
+    vkQueueSubmit(vk->graphics_queue, 1, &submit, VK_NULL_HANDLE);
+    vkQueueWaitIdle(vk->graphics_queue);
+    vkFreeCommandBuffers(vk->device, vk->command_pool, 1, &cmd);
+    return true;
+}
+
+static void
+vk_update_animated_images(struct server_vk *vk) {
+    if (!vk || !vk->device) return;
+
+    const uint64_t now = now_ms();
+    bool waited = false;
+    struct vk_image *image;
+    wl_list_for_each(image, &vk->images, link) {
+        if (!image->enabled) continue;
+        if (!image->owns_image) continue;
+        if (!image->frames || image->frame_count <= 1) continue;
+        if (now < image->next_frame_ms) continue;
+
+        if (!waited) {
+            vkDeviceWaitIdle(vk->device);
+            waited = true;
+        }
+
+        image->frame_index = (image->frame_index + 1) % image->frame_count;
+        struct util_avif_frame *frame = &image->frames[image->frame_index];
+        (void)vk_image_write_rgba(vk, image, (const unsigned char *)frame->data, (uint32_t)frame->width,
+                                  (uint32_t)frame->height);
+
+        double dur_s = frame->duration;
+        if (!(dur_s > 0.0)) dur_s = 0.1;
+        uint64_t dur_ms = (uint64_t)llround(dur_s * 1000.0);
+        if (dur_ms == 0) dur_ms = 1;
+        image->next_frame_ms = now + dur_ms;
+    }
+}
 
 // Generated SPIR-V shader bytecode
 #include "shader_spirv.h"
@@ -83,6 +784,12 @@ static void on_surface_commit(struct wl_listener *listener, void *data);
 static void on_surface_destroy(struct wl_listener *listener, void *data);
 static void on_ui_resize(struct wl_listener *listener, void *data);
 static uint32_t find_memory_type(struct server_vk *vk, uint32_t type_filter, VkMemoryPropertyFlags properties);
+
+// Text rendering forward declarations
+static bool init_font_system(struct server_vk *vk, const char *font_path, uint32_t base_size);
+static void destroy_font_system(struct server_vk *vk);
+static bool create_text_vk_pipeline(struct server_vk *vk);
+// static void draw_texts(struct server_vk *vk, VkCommandBuffer cmd);
 
 // ============================================================================
 // Instance Creation
@@ -172,7 +879,7 @@ check_device_extensions(VkPhysicalDevice device) {
 
 static bool
 find_queue_families(VkPhysicalDevice device, VkSurfaceKHR surface,
-                    uint32_t *graphics_family, uint32_t *present_family) {
+                    uint32_t *graphics_family, uint32_t *present_family, uint32_t *transfer_family) {
     uint32_t count = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(device, &count, NULL);
 
@@ -181,6 +888,7 @@ find_queue_families(VkPhysicalDevice device, VkSurfaceKHR surface,
 
     bool found_graphics = false;
     bool found_present = false;
+    bool found_transfer = false;
 
     for (uint32_t i = 0; i < count; i++) {
         if (props[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
@@ -195,13 +903,27 @@ find_queue_families(VkPhysicalDevice device, VkSurfaceKHR surface,
             found_present = true;
         }
 
+        // Look for dedicated transfer queue (without graphics bit)
+        if ((props[i].queueFlags & VK_QUEUE_TRANSFER_BIT) &&
+            !(props[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) &&
+            !found_transfer) {
+            *transfer_family = i;
+            found_transfer = true;
+        }
+
         if (found_graphics && found_present) {
             break;
         }
     }
 
+    // If no dedicated transfer queue, fall back to graphics queue
+    if (!found_transfer && found_graphics) {
+        *transfer_family = *graphics_family;
+        found_transfer = true;
+    }
+
     free(props);
-    return found_graphics && found_present;
+    return found_graphics && found_present && found_transfer;
 }
 
 static bool
@@ -217,14 +939,60 @@ select_physical_device(struct server_vk *vk) {
     VkPhysicalDevice *devices = zalloc(count, sizeof(*devices));
     vkEnumeratePhysicalDevices(vk->instance, &count, devices);
 
-    // Prefer discrete GPU (AMD), fall back to any suitable device
-    VkPhysicalDevice selected = VK_NULL_HANDLE;
+    // Prefer AMD discrete GPU (0x1002). If env WAYWALL_VK_VENDOR is set to "amd"/"intel",
+    // honor it. Default: use legacy selection (last discrete wins) to avoid FPS cap regression;
+    // set WAYWALL_GPU_SELECT_STRICT=1 to enable the new AMD-first selection by default.
+    // Env WAYWALL_GPU_SELECT_LEGACY explicitly forces the legacy path.
+    const char *env_vendor = getenv("WAYWALL_VK_VENDOR");
+    bool prefer_amd = true;
+    bool prefer_intel = false;
+    bool use_legacy_select = true;
+    if (env_vendor) {
+        if (strcasecmp(env_vendor, "intel") == 0) {
+            prefer_amd = false;
+            prefer_intel = true;
+            use_legacy_select = false;  // explicit vendor request
+        } else if (strcasecmp(env_vendor, "amd") == 0) {
+            prefer_amd = true;
+            prefer_intel = false;
+            use_legacy_select = false;  // explicit vendor request
+        }
+    } else {
+        if (getenv("WAYWALL_GPU_SELECT_STRICT")) {
+            use_legacy_select = false; // opt in to AMD-first without vendor env
+        } else if (getenv("WAYWALL_GPU_SELECT_LEGACY")) {
+            use_legacy_select = true;
+        } else {
+            use_legacy_select = true; // default to legacy
+        }
+    }
+
+    // Prefer AMD discrete GPU (0x1002). If not present, prefer first discrete GPU.
+    VkPhysicalDevice preferred_amd = VK_NULL_HANDLE;
+    VkPhysicalDevice preferred_discrete = VK_NULL_HANDLE;
+    VkPhysicalDevice preferred_intel = VK_NULL_HANDLE;
     VkPhysicalDevice fallback = VK_NULL_HANDLE;
+
+    // Legacy path variables
+    VkPhysicalDevice legacy_selected = VK_NULL_HANDLE;
+    VkPhysicalDevice legacy_fallback = VK_NULL_HANDLE;
+    bool legacy_prefer_amd_last = getenv("WAYWALL_PREFER_AMD_LEGACY") != NULL;
+
+    uint32_t amd_gfx = 0, amd_present = 0, amd_transfer = 0;
+    uint32_t discrete_gfx = 0, discrete_present = 0, discrete_transfer = 0;
+    uint32_t fb_gfx = 0, fb_present = 0, fb_transfer = 0;
+
+    uint32_t legacy_gfx = 0, legacy_present = 0, legacy_transfer = 0;
+    uint32_t legacy_fb_gfx = 0, legacy_fb_present = 0, legacy_fb_transfer = 0;
 
     bool has_amd = false;
     bool has_intel = false;
 
-    for (uint32_t i = 0; i < count; i++) {
+    uint32_t passes = (use_legacy_select && legacy_prefer_amd_last) ? 2 : 1;
+    for (uint32_t pass = 0; pass < passes; pass++) {
+        bool prefer_amd_pass = legacy_prefer_amd_last && pass == 1;
+
+        for (uint32_t i = 0; i < count; i++) {
         VkPhysicalDeviceProperties props;
         vkGetPhysicalDeviceProperties(devices[i], &props);
 
@@ -237,27 +1005,108 @@ select_physical_device(struct server_vk *vk) {
             continue;
         }
 
-        uint32_t gfx_family, present_family;
-        if (!find_queue_families(devices[i], vk->swapchain.surface, &gfx_family, &present_family)) {
+        uint32_t gfx_family, present_family, transfer_family;
+        if (!find_queue_families(devices[i], vk->swapchain.surface, &gfx_family, &present_family, &transfer_family)) {
             continue;
         }
 
         vk_log(LOG_INFO, "found suitable device: %s", props.deviceName);
 
-        if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
-            selected = devices[i];
-            vk->graphics_family = gfx_family;
-            vk->present_family = present_family;
-            // break; // Don't break early so we can detect all vendors
-        } else if (fallback == VK_NULL_HANDLE) {
+        // Legacy path: last discrete wins, fallback is first suitable.
+        // If WAYWALL_PREFER_AMD_LEGACY is set, we iterate twice and place AMD last.
+        if (use_legacy_select) {
+            if (legacy_prefer_amd_last) {
+                if (prefer_amd_pass && props.vendorID != 0x1002) {
+                    continue; // skip non-AMD in AMD pass
+                }
+                if (!prefer_amd_pass && props.vendorID == 0x1002) {
+                    continue; // skip AMD in non-AMD pass
+                }
+            }
+
+            if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
+                legacy_selected = devices[i];
+                legacy_gfx = gfx_family;
+                legacy_present = present_family;
+                legacy_transfer = transfer_family;
+            } else if (legacy_fallback == VK_NULL_HANDLE) {
+                legacy_fallback = devices[i];
+                legacy_fb_gfx = gfx_family;
+                legacy_fb_present = present_family;
+                legacy_fb_transfer = transfer_family;
+            }
+            continue;
+        }
+
+        // New path: AMD > first discrete > fallback
+        if (props.vendorID == 0x1002 && props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
+            // Strong preference: AMD dGPU
+            preferred_amd = devices[i];
+            amd_gfx = gfx_family;
+            amd_present = present_family;
+            amd_transfer = transfer_family;
+            // Keep scanning to record detection flags, but selection is decided.
+            continue;
+        }
+
+        if (props.vendorID == 0x8086 && preferred_intel == VK_NULL_HANDLE &&
+            props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
+            preferred_intel = devices[i];
+            discrete_gfx = gfx_family;
+            discrete_present = present_family;
+            discrete_transfer = transfer_family;
+        }
+
+        if (preferred_discrete == VK_NULL_HANDLE &&
+            props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
+            preferred_discrete = devices[i];
+            discrete_gfx = gfx_family;
+            discrete_present = present_family;
+            discrete_transfer = transfer_family;
+        }
+
+        if (fallback == VK_NULL_HANDLE) {
             fallback = devices[i];
-            vk->graphics_family = gfx_family;
-            vk->present_family = present_family;
+            fb_gfx = gfx_family;
+            fb_present = present_family;
+            fb_transfer = transfer_family;
+        }
         }
     }
 
-    if (selected == VK_NULL_HANDLE) {
-        selected = fallback;
+    VkPhysicalDevice selected = VK_NULL_HANDLE;
+    if (use_legacy_select) {
+        selected = legacy_selected ? legacy_selected : legacy_fallback;
+        if (selected) {
+            vk->graphics_family = legacy_selected ? legacy_gfx : legacy_fb_gfx;
+            vk->present_family = legacy_selected ? legacy_present : legacy_fb_present;
+            vk->transfer_family = legacy_selected ? legacy_transfer : legacy_fb_transfer;
+        }
+        if (selected) {
+            vk_log(LOG_INFO, "Legacy GPU selection enabled (WAYWALL_GPU_SELECT_LEGACY)");
+        }
+    } else {
+        if (prefer_amd && preferred_amd != VK_NULL_HANDLE) {
+            selected = preferred_amd;
+            vk->graphics_family = amd_gfx;
+            vk->present_family = amd_present;
+            vk->transfer_family = amd_transfer;
+        } else if (prefer_intel && preferred_intel != VK_NULL_HANDLE) {
+            selected = preferred_intel;
+            vk->graphics_family = discrete_gfx;
+            vk->present_family = discrete_present;
+            vk->transfer_family = discrete_transfer;
+        } else if (preferred_discrete != VK_NULL_HANDLE) {
+            selected = preferred_discrete;
+            vk->graphics_family = discrete_gfx;
+            vk->present_family = discrete_present;
+            vk->transfer_family = discrete_transfer;
+        } else if (fallback != VK_NULL_HANDLE) {
+            selected = fallback;
+            vk->graphics_family = fb_gfx;
+            vk->present_family = fb_present;
+            vk->transfer_family = fb_transfer;
+        }
     }
 
     free(devices);
@@ -275,8 +1124,17 @@ select_physical_device(struct server_vk *vk) {
     VkPhysicalDeviceProperties props;
     vkGetPhysicalDeviceProperties(selected, &props);
     vk_log(LOG_INFO, "selected device: %s (dual_gpu=%s)", props.deviceName, vk->dual_gpu ? "true" : "false");
+    vk_log(LOG_INFO, "queue families: graphics=%u, present=%u, transfer=%u%s",
+           vk->graphics_family, vk->present_family, vk->transfer_family,
+           vk->transfer_family != vk->graphics_family ? " (dedicated)" : "");
 
     vkGetPhysicalDeviceMemoryProperties(selected, &vk->memory_properties);
+
+    // Enable async pipelining if dual-GPU and env var is set
+    vk->async_pipelining_enabled = vk->dual_gpu && getenv("WAYWALL_ASYNC_PIPELINING") != NULL;
+    if (vk->async_pipelining_enabled) {
+        vk_log(LOG_INFO, "Async pipelining ENABLED for dual-GPU setup");
+    }
 
     return true;
 }
@@ -287,12 +1145,22 @@ select_physical_device(struct server_vk *vk) {
 
 static bool
 create_device(struct server_vk *vk) {
-    // Queue create infos
+    // Queue create infos - support up to 3 unique families
     float priority = 1.0f;
-    uint32_t unique_families[2] = { vk->graphics_family, vk->present_family };
-    uint32_t unique_count = (vk->graphics_family == vk->present_family) ? 1 : 2;
+    uint32_t unique_families[3] = { vk->graphics_family, vk->present_family, vk->transfer_family };
+    uint32_t unique_count = 1;
 
-    VkDeviceQueueCreateInfo queue_infos[2];
+    // Add present family if different from graphics
+    if (vk->present_family != vk->graphics_family) {
+        unique_families[unique_count++] = vk->present_family;
+    }
+
+    // Add transfer family if different from both graphics and present
+    if (vk->transfer_family != vk->graphics_family && vk->transfer_family != vk->present_family) {
+        unique_families[unique_count++] = vk->transfer_family;
+    }
+
+    VkDeviceQueueCreateInfo queue_infos[3];
     for (uint32_t i = 0; i < unique_count; i++) {
         queue_infos[i] = (VkDeviceQueueCreateInfo){
             .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
@@ -324,10 +1192,27 @@ create_device(struct server_vk *vk) {
 
     vkGetDeviceQueue(vk->device, vk->graphics_family, 0, &vk->graphics_queue);
     vkGetDeviceQueue(vk->device, vk->present_family, 0, &vk->present_queue);
+    vkGetDeviceQueue(vk->device, vk->transfer_family, 0, &vk->transfer_queue);
 
     pfn_vkImportSemaphoreFdKHR = (PFN_vkImportSemaphoreFdKHR)vkGetDeviceProcAddr(vk->device, "vkImportSemaphoreFdKHR");
     if (!pfn_vkImportSemaphoreFdKHR) {
         vk_log(LOG_WARN, "failed to load vkImportSemaphoreFdKHR - explicit sync disabled");
+    }
+
+    // Create transfer command pool if async pipelining is enabled
+    if (vk->async_pipelining_enabled) {
+        VkCommandPoolCreateInfo pool_info = {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+            .queueFamilyIndex = vk->transfer_family,
+            .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+        };
+        result = vkCreateCommandPool(vk->device, &pool_info, NULL, &vk->transfer_pool);
+        if (result != VK_SUCCESS) {
+            vk_log(LOG_ERROR, "failed to create transfer command pool: %d", result);
+            vk->async_pipelining_enabled = false;
+        } else {
+            vk_log(LOG_INFO, "created transfer command pool for async pipelining");
+        }
     }
 
     vk_log(LOG_INFO, "created logical device");
@@ -371,9 +1256,22 @@ choose_present_mode(VkPhysicalDevice device, VkSurfaceKHR surface) {
     VkPresentModeKHR *modes = zalloc(count, sizeof(*modes));
     vkGetPhysicalDeviceSurfacePresentModesKHR(device, surface, &count, modes);
 
+    // Optional override via env: WAYWALL_PRESENT_MODE=IMMEDIATE|MAILBOX|FIFO
+    VkPresentModeKHR forced = VK_PRESENT_MODE_MAX_ENUM_KHR;
+    const char *env_mode = getenv("WAYWALL_PRESENT_MODE");
+    if (env_mode) {
+        if (strcasecmp(env_mode, "IMMEDIATE") == 0) forced = VK_PRESENT_MODE_IMMEDIATE_KHR;
+        else if (strcasecmp(env_mode, "MAILBOX") == 0) forced = VK_PRESENT_MODE_MAILBOX_KHR;
+        else if (strcasecmp(env_mode, "FIFO") == 0) forced = VK_PRESENT_MODE_FIFO_KHR;
+    }
+
     // Prefer IMMEDIATE (no vsync) > MAILBOX (low latency) > FIFO (vsync)
     VkPresentModeKHR selected = VK_PRESENT_MODE_FIFO_KHR;  // Always available
     for (uint32_t i = 0; i < count; i++) {
+        if (forced != VK_PRESENT_MODE_MAX_ENUM_KHR && modes[i] == forced) {
+            selected = modes[i];
+            break;
+        }
         if (modes[i] == VK_PRESENT_MODE_IMMEDIATE_KHR) {
             selected = VK_PRESENT_MODE_IMMEDIATE_KHR;
             break;
@@ -383,10 +1281,21 @@ choose_present_mode(VkPhysicalDevice device, VkSurfaceKHR surface) {
         }
     }
 
+    const char *sel_name = "UNKNOWN";
+    switch (selected) {
+    case VK_PRESENT_MODE_IMMEDIATE_KHR: sel_name = "IMMEDIATE"; break;
+    case VK_PRESENT_MODE_MAILBOX_KHR: sel_name = "MAILBOX"; break;
+    case VK_PRESENT_MODE_FIFO_KHR: sel_name = "FIFO"; break;
+    case VK_PRESENT_MODE_FIFO_RELAXED_KHR: sel_name = "FIFO_RELAXED"; break;
+    default: break;
+    }
+    if (forced != VK_PRESENT_MODE_MAX_ENUM_KHR) {
+        vk_log(LOG_INFO, "Present mode: forced %s (selected=%s)", env_mode ? env_mode : "?", sel_name);
+    } else {
+        vk_log(LOG_INFO, "Present mode: selected=%s", sel_name);
+    }
+
     free(modes);
-    vk_log(LOG_INFO, "using present mode: %s",
-           selected == VK_PRESENT_MODE_IMMEDIATE_KHR ? "IMMEDIATE" :
-           selected == VK_PRESENT_MODE_MAILBOX_KHR ? "MAILBOX" : "FIFO");
     return selected;
 }
 
@@ -418,6 +1327,12 @@ create_swapchain(struct server_vk *vk, uint32_t width, uint32_t height, VkSwapch
         image_count = caps.maxImageCount;
     }
 
+    // Check for transparent compositing support (for background visibility)
+    VkCompositeAlphaFlagBitsKHR composite_alpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    if (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR) {
+        composite_alpha = VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR;
+    }
+
     VkSwapchainCreateInfoKHR create_info = {
         .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
         .surface = vk->swapchain.surface,
@@ -428,7 +1343,7 @@ create_swapchain(struct server_vk *vk, uint32_t width, uint32_t height, VkSwapch
         .imageArrayLayers = 1,
         .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
         .preTransform = caps.currentTransform,
-        .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
+        .compositeAlpha = composite_alpha,
         .presentMode = present_mode,
         .clipped = VK_TRUE,
         .oldSwapchain = old_swapchain,
@@ -485,8 +1400,6 @@ create_swapchain(struct server_vk *vk, uint32_t width, uint32_t height, VkSwapch
         }
     }
 
-    vk_log(LOG_INFO, "created swapchain: %dx%d, %d images",
-           extent.width, extent.height, vk->swapchain.image_count);
     return true;
 }
 
@@ -1300,11 +2213,11 @@ create_buffer_blit_pipeline(struct server_vk *vk) {
         return false;
     }
 
-    // Push constants: width, height, stride, swap_colors
+    // Push constants: width, height, stride, swap_colors, src_x, src_y, src_w, src_h
     VkPushConstantRange push_range = {
         .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
         .offset = 0,
-        .size = sizeof(int32_t) * 4,  // width, height, stride, swap_colors
+        .size = sizeof(int32_t) * 8,  // 8 ints for source cropping
     };
 
     VkPipelineLayoutCreateInfo pipeline_layout_ci = {
@@ -1533,16 +2446,17 @@ create_mirror_pipeline(struct server_vk *vk) {
         .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
     };
 
-    // Enable alpha blending for mirrors
+    // Pre-multiplied alpha blending for mirrors
+    // Mirror outputs either opaque (alpha=1) or fully transparent (alpha=0), both are pre-multiplied
     VkPipelineColorBlendAttachmentState blend_attachment = {
         .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
                           VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
         .blendEnable = VK_TRUE,
-        .srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA,
+        .srcColorBlendFactor = VK_BLEND_FACTOR_ONE,  // Pre-multiplied alpha
         .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
         .colorBlendOp = VK_BLEND_OP_ADD,
         .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
-        .dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO,
+        .dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
         .alphaBlendOp = VK_BLEND_OP_ADD,
     };
 
@@ -1670,16 +2584,17 @@ create_image_pipeline(struct server_vk *vk) {
         .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
     };
 
-    // Enable alpha blending for images with transparency
+    // Pre-multiplied alpha blending for images with transparency
+    // Shader outputs pre-multiplied colors (rgb * a, a), so use ONE for srcColor
     VkPipelineColorBlendAttachmentState blend_attachment = {
         .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
                           VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
         .blendEnable = VK_TRUE,
-        .srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA,
+        .srcColorBlendFactor = VK_BLEND_FACTOR_ONE,  // Pre-multiplied: colors already include alpha
         .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
         .colorBlendOp = VK_BLEND_OP_ADD,
         .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
-        .dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO,
+        .dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
         .alphaBlendOp = VK_BLEND_OP_ADD,
     };
 
@@ -1739,19 +2654,33 @@ destroy_pipeline(struct server_vk *vk, struct vk_pipeline *pipeline) {
 // ============================================================================
 
 struct server_vk *
-server_vk_create(struct server *server) {
+server_vk_create(struct server *server, struct config *cfg) {
     struct server_vk *vk = zalloc(1, sizeof(*vk));
     vk->server = server;
     vk->drm_fd = -1;
+    vk->fps_last_time_ms = now_ms();
+    vk->fps_frame_count = 0;
+    vk->disable_capture_sync_wait = getenv("WAYWALL_DISABLE_CAPTURE_SYNC_WAIT") != NULL;
+    // Prefer modifier-based dma-buf imports when we know we're doing cross-GPU (subprocess offload)
+    // to avoid ReBAR-limited linear paths. Env can still force it.
+    bool env_allow_mods = getenv("WAYWALL_DMABUF_ALLOW_MODIFIERS") != NULL;
+    vk->allow_modifiers =
+        env_allow_mods || (server->linux_dmabuf && server->linux_dmabuf->allow_modifiers);
+    vk->proxy_game = getenv("WAYWALL_VK_PROXY_GAME") != NULL;
+    vk->overlay_tick = NULL;
+    vk->overlay_tick_ms = refresh_mhz_to_ms(server->ui ? server->ui->refresh_mhz : 0);
 
     vk_log(LOG_INFO, "creating Vulkan backend");
 
     wl_list_init(&vk->capture.buffers);
     wl_list_init(&vk->mirrors);
     wl_list_init(&vk->images);
+    wl_list_init(&vk->atlases);
     wl_list_init(&vk->texts);
+    wl_list_init(&vk->views);
     wl_signal_init(&vk->events.frame);
     wl_list_init(&vk->on_ui_resize.link);
+    wl_list_init(&vk->on_ui_refresh.link);
 
     // Create Vulkan instance
     if (!create_instance(vk)) {
@@ -1777,8 +2706,7 @@ server_vk_create(struct server *server) {
     }
     wl_subsurface_set_desync(vk->swapchain.subsurface);
     wl_subsurface_set_position(vk->swapchain.subsurface, 0, 0);
-    // Place below the GL surface so UI overlays render on top
-    wl_subsurface_place_below(vk->swapchain.subsurface, server->ui->tree.surface);
+    // Match GL behavior - don't call place_below, let subsurface stack naturally
 
     VkWaylandSurfaceCreateInfoKHR surface_info = {
         .sType = VK_STRUCTURE_TYPE_WAYLAND_SURFACE_CREATE_INFO_KHR,
@@ -1825,9 +2753,8 @@ server_vk_create(struct server *server) {
     }
 
     // Initialize font system for text rendering
-    struct config *cfg = server->config;
-    const char *font_path = cfg->theme.font_path;
-    uint32_t font_size = cfg->theme.font_size > 0 ? cfg->theme.font_size : 16;
+    const char *font_path = cfg ? cfg->theme.font_path : NULL;
+    uint32_t font_size = 1;  // Size is specified per-text (pixels)
     if (font_path && font_path[0]) {
         if (!init_font_system(vk, font_path, font_size)) {
             vk_log(LOG_WARN, "font system initialization failed, text rendering disabled");
@@ -1854,6 +2781,43 @@ server_vk_create(struct server *server) {
     vk->on_ui_resize.notify = on_ui_resize;
     wl_signal_add(&server->ui->events.resize, &vk->on_ui_resize);
 
+    if (vk->proxy_game) {
+        VkCommandBufferAllocateInfo alloc_info = {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+            .commandPool = vk->command_pool,
+            .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+            .commandBufferCount = DMABUF_EXPORT_MAX,
+        };
+        VkResult result =
+            vkAllocateCommandBuffers(vk->device, &alloc_info, vk->proxy_copy.command_buffers);
+        if (result != VK_SUCCESS) {
+            vk_log(LOG_ERROR, "failed to allocate proxy copy command buffers: %d", result);
+            goto fail;
+        }
+
+        VkFenceCreateInfo fence_info = {
+            .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+            .flags = VK_FENCE_CREATE_SIGNALED_BIT,
+        };
+        for (uint32_t i = 0; i < DMABUF_EXPORT_MAX; i++) {
+            result = vkCreateFence(vk->device, &fence_info, NULL, &vk->proxy_copy.fences[i]);
+            if (result != VK_SUCCESS) {
+                vk_log(LOG_ERROR, "failed to create proxy copy fence: %d", result);
+                goto fail;
+            }
+        }
+        vk->proxy_copy.index = 0;
+
+        // Drive overlay rendering independently of the game’s surface commits.
+        vk->on_ui_refresh.notify = on_ui_refresh;
+        wl_signal_add(&server->ui->events.refresh, &vk->on_ui_refresh);
+
+        struct wl_event_loop *loop = wl_display_get_event_loop(server->display);
+        vk->overlay_tick = wl_event_loop_add_timer(loop, handle_overlay_tick, vk);
+        check_alloc(vk->overlay_tick);
+        wl_event_source_timer_update(vk->overlay_tick, vk->overlay_tick_ms);
+    }
+
     vk_log(LOG_INFO, "Vulkan backend initialized successfully");
     return vk;
 
@@ -1868,8 +2832,21 @@ server_vk_destroy(struct server_vk *vk) {
 
     // Remove UI resize listener
     wl_list_remove(&vk->on_ui_resize.link);
+    wl_list_remove(&vk->on_ui_refresh.link);
+
+    if (vk->overlay_tick) {
+        wl_event_source_remove(vk->overlay_tick);
+        vk->overlay_tick = NULL;
+    }
 
     if (vk->device) {
+        for (uint32_t i = 0; i < DMABUF_EXPORT_MAX; i++) {
+            if (vk->proxy_copy.fences[i]) {
+                vkDestroyFence(vk->device, vk->proxy_copy.fences[i], NULL);
+                vk->proxy_copy.fences[i] = VK_NULL_HANDLE;
+            }
+        }
+
         vkDeviceWaitIdle(vk->device);
     }
 
@@ -1977,9 +2954,6 @@ server_vk_destroy(struct server_vk *vk) {
     // Destroy blit pipeline's own resources
     if (vk->blit_pipeline.vert) {
         vkDestroyShaderModule(vk->device, vk->blit_pipeline.vert, NULL);
-    }
-    if (vk->blit_pipeline.frag) {
-        vkDestroyShaderModule(vk->device, vk->blit_pipeline.frag, NULL);
     }
     if (vk->blit_pipeline.descriptor_layout) {
         vkDestroyDescriptorSetLayout(vk->device, vk->blit_pipeline.descriptor_layout, NULL);
@@ -2218,8 +3192,9 @@ draw_captured_frame(struct server_vk *vk, VkCommandBuffer cmd) {
     int32_t x = (window_width / 2) - (game_width / 2);
     int32_t y = (window_height / 2) - (game_height / 2);
 
-    // Calculate viewport dimensions (handle case where game is larger than window)
+    // Calculate viewport position and source crop region for oversized games
     int32_t vp_x, vp_y, vp_width, vp_height;
+    int32_t src_x = 0, src_y = 0, src_w = game_width, src_h = game_height;
 
     if (x >= 0 && y >= 0) {
         // Game fits entirely within window - center it
@@ -2227,16 +3202,27 @@ draw_captured_frame(struct server_vk *vk, VkCommandBuffer cmd) {
         vp_y = y;
         vp_width = game_width;
         vp_height = game_height;
+        // No source cropping needed - show entire game
     } else {
-        // Game is larger than window - fill entire window
-        // The game content will be cropped by the viewport
-        vp_x = (x < 0) ? 0 : x;
-        vp_y = (y < 0) ? 0 : y;
-        vp_width = (x < 0) ? window_width : game_width;
-        vp_height = (y < 0) ? window_height : game_height;
+        // Game is larger than window in one or both dimensions
+        // Match layout_centered from ui.c: crop from CENTER of game
+        int32_t crop_width = (x >= 0) ? game_width : window_width;
+        int32_t crop_height = (y >= 0) ? game_height : window_height;
+
+        // Source crop from center of game (same as OpenGL viewporter)
+        src_x = (game_width / 2) - (crop_width / 2);
+        src_y = (game_height / 2) - (crop_height / 2);
+        src_w = crop_width;
+        src_h = crop_height;
+
+        // Viewport position (clamp to window bounds)
+        vp_x = (x >= 0) ? x : 0;
+        vp_y = (y >= 0) ? y : 0;
+        vp_width = crop_width;
+        vp_height = crop_height;
     }
 
-    // Set viewport to centered position
+    // Set viewport to the visible area
     VkViewport viewport = {
         .x = (float)vp_x,
         .y = (float)vp_y,
@@ -2270,14 +3256,20 @@ draw_captured_frame(struct server_vk *vk, VkCommandBuffer cmd) {
             int32_t height;
             int32_t stride;
             int32_t swap_colors;
+            int32_t src_x;
+            int32_t src_y;
+            int32_t src_w;
+            int32_t src_h;
         } pc;
 
-        pc.width = capture->width;
-        pc.height = capture->height;
+        pc.width = game_width;
+        pc.height = game_height;
         pc.stride = capture->stride;
-        // Buffer path reads raw memory (BGRX), so manual unpacking is consistent.
-        // No swap needed regardless of GPU combination.
-        pc.swap_colors = 0;
+        pc.swap_colors = 0;  // Buffer path uses consistent unpacking
+        pc.src_x = src_x;
+        pc.src_y = src_y;
+        pc.src_w = src_w;
+        pc.src_h = src_h;
 
         vkCmdPushConstants(cmd, vk->buffer_blit.layout, VK_SHADER_STAGE_FRAGMENT_BIT,
                            0, sizeof(pc), &pc);
@@ -2297,151 +3289,364 @@ draw_captured_frame(struct server_vk *vk, VkCommandBuffer cmd) {
     }
 }
 
-// Draw all enabled mirrors
+// Sorting types
+enum render_item_type { ITEM_MIRROR, ITEM_IMAGE, ITEM_TEXT, ITEM_VIEW };
+
+struct render_item {
+    int32_t depth;
+    enum render_item_type type;
+    void *obj;
+};
+
+static int compare_render_items(const void *a, const void *b) {
+    const struct render_item *ia = a;
+    const struct render_item *ib = b;
+    if (ia->depth != ib->depth) {
+        return ia->depth - ib->depth;
+    }
+    // Stable sort by type to minimize pipeline switches
+    return (int)ia->type - (int)ib->type;
+}
+
 static void
-draw_mirrors(struct server_vk *vk, VkCommandBuffer cmd) {
+draw_mirror_single(struct server_vk *vk, VkCommandBuffer cmd, struct vk_mirror *mirror) {
     struct vk_buffer *capture = vk->capture.current;
     if (!capture || !capture->storage_buffer || !capture->buffer_descriptor_set) {
-        return;  // Need storage buffer path for mirrors
+        return;
     }
 
-    if (wl_list_empty(&vk->mirrors)) {
-        return;  // No mirrors to draw
+    // Set viewport for this mirror's destination
+    VkViewport viewport = {
+        .x = (float)mirror->dst.x,
+        .y = (float)mirror->dst.y,
+        .width = (float)mirror->dst.width,
+        .height = (float)mirror->dst.height,
+        .minDepth = 0.0f,
+        .maxDepth = 1.0f,
+    };
+    vkCmdSetViewport(cmd, 0, 1, &viewport);
+
+    // Scissor to window bounds
+    VkRect2D scissor = {
+        .offset = { 0, 0 },
+        .extent = vk->swapchain.extent,
+    };
+    vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+    // Prepare push constants
+    struct mirror_push_constants pc = {
+        .game_width = capture->width,
+        .game_height = capture->height,
+        .game_stride = capture->stride,
+        .src_x = mirror->src.x,
+        .src_y = mirror->src.y,
+        .src_w = mirror->src.width,
+        .src_h = mirror->src.height,
+        .color_key_enabled = mirror->color_key_enabled ? 1 : 0,
+        .key_r = ((mirror->color_key_input >> 16) & 0xFF) / 255.0f,
+        .key_g = ((mirror->color_key_input >> 8) & 0xFF) / 255.0f,
+        .key_b = (mirror->color_key_input & 0xFF) / 255.0f,
+        .out_r = ((mirror->color_key_output >> 16) & 0xFF) / 255.0f,
+        .out_g = ((mirror->color_key_output >> 8) & 0xFF) / 255.0f,
+        .out_b = (mirror->color_key_output & 0xFF) / 255.0f,
+        .tolerance = mirror->color_key_tolerance,
+    };
+
+    vkCmdPushConstants(cmd, vk->mirror_pipeline.layout, VK_SHADER_STAGE_FRAGMENT_BIT,
+                       0, sizeof(pc), &pc);
+    vkCmdDraw(cmd, 6, 1, 0, 0);
+}
+
+static void
+draw_image_single(struct server_vk *vk, VkCommandBuffer cmd, struct vk_image *image) {
+    if (!image->enabled || image->descriptor_set == VK_NULL_HANDLE) {
+        return;
     }
 
-    // Debug: log capture dimensions and mirror count (once per second)
-    static int frame_count = 0;
-    if (++frame_count % 60 == 0) {
-        int mirror_count = 0;
-        struct vk_mirror *m;
-        wl_list_for_each(m, &vk->mirrors, link) {
-            mirror_count++;
-        }
-        vk_log(LOG_INFO, "draw_mirrors: capture=%dx%d stride=%u, %d mirrors in list",
-               capture->width, capture->height, capture->stride, mirror_count);
-    }
+    VkDeviceSize offset = 0;
+    VkBuffer vertex_buffer = image->vertex_buffer ? image->vertex_buffer : vk->quad_vertex_buffer;
+    vkCmdBindVertexBuffers(cmd, 0, 1, &vertex_buffer, &offset);
 
-    // Bind mirror pipeline and descriptor set
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk->mirror_pipeline.pipeline);
+    // Bind this image's descriptor set
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                            vk->mirror_pipeline.layout, 0, 1,
-                            &capture->buffer_descriptor_set, 0, NULL);
+                            vk->image_pipeline.layout, 0, 1,
+                            &image->descriptor_set, 0, NULL);
+
+    // Set viewport for this image's destination
+    VkViewport viewport = {
+        .x = (float)image->dst.x,
+        .y = (float)image->dst.y,
+        .width = (float)image->dst.width,
+        .height = (float)image->dst.height,
+        .minDepth = 0.0f,
+        .maxDepth = 1.0f,
+    };
+    vkCmdSetViewport(cmd, 0, 1, &viewport);
+
+    // Scissor to window bounds
+    VkRect2D scissor = {
+        .offset = { 0, 0 },
+        .extent = vk->swapchain.extent,
+    };
+    vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+    vkCmdDraw(cmd, 6, 1, 0, 0);
+}
+
+static void
+draw_text_single(struct server_vk *vk, VkCommandBuffer cmd, struct vk_text *text) {
+    if (!text->enabled || !text->font || text->vertex_count == 0) {
+        return;
+    }
+
+    struct vk_push_constants pc = {
+        .src_size = { (float)text->font->atlas_width, (float)text->font->atlas_height },
+        .dst_size = { (float)vk->swapchain.extent.width, (float)vk->swapchain.extent.height },
+    };
+    vkCmdPushConstants(cmd, vk->text_vk_pipeline.layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
+                       sizeof(pc), &pc);
+
+    // Bind font atlas descriptor
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                            vk->text_vk_pipeline.layout, 0, 1,
+                            &text->font->atlas_descriptor, 0, NULL);
+
+    // Bind vertex buffer
+    VkDeviceSize offset = 0;
+    vkCmdBindVertexBuffers(cmd, 0, 1, &text->vertex_buffer, &offset);
+
+    // Set viewport to cover entire screen
+    VkViewport viewport = {
+        .x = 0, .y = 0,
+        .width = (float)vk->swapchain.extent.width,
+        .height = (float)vk->swapchain.extent.height,
+        .minDepth = 0.0f, .maxDepth = 1.0f,
+    };
+    vkCmdSetViewport(cmd, 0, 1, &viewport);
+
+    VkRect2D scissor = {
+        .offset = { 0, 0 },
+        .extent = vk->swapchain.extent,
+    };
+    vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+    vkCmdDraw(cmd, text->vertex_count, 1, 0, 0);
+}
+
+static void
+draw_view_single(struct server_vk *vk, VkCommandBuffer cmd, struct vk_view *view) {
+    vk_log(LOG_INFO, "draw_view_single: view=%p, enabled=%d, buffer=%p", 
+           (void*)view, view->enabled, (void*)view->current_buffer);
+    if (!view->enabled || !view->current_buffer) {
+        vk_log(LOG_INFO, "draw_view_single: skipping (not ready)");
+        return;
+    }
+
+    struct vk_buffer *buf = view->current_buffer;
 
     VkDeviceSize offset = 0;
     vkCmdBindVertexBuffers(cmd, 0, 1, &vk->quad_vertex_buffer, &offset);
 
-    struct vk_mirror *mirror;
-    wl_list_for_each(mirror, &vk->mirrors, link) {
-        if (!mirror->enabled) {
-            continue;
-        }
+    VkViewport viewport = {
+        .x = (float)view->dst.x,
+        .y = (float)view->dst.y,
+        .width = (float)view->dst.width,
+        .height = (float)view->dst.height,
+        .minDepth = 0.0f,
+        .maxDepth = 1.0f,
+    };
+    vkCmdSetViewport(cmd, 0, 1, &viewport);
 
-        // Set viewport for this mirror's destination
-        VkViewport viewport = {
-            .x = (float)mirror->dst.x,
-            .y = (float)mirror->dst.y,
-            .width = (float)mirror->dst.width,
-            .height = (float)mirror->dst.height,
-            .minDepth = 0.0f,
-            .maxDepth = 1.0f,
+    VkRect2D scissor = {
+        .offset = { 0, 0 },
+        .extent = vk->swapchain.extent,
+    };
+    vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+    // Use buffer_blit path for cross-GPU with stride mismatch (NATIVE path)
+    if (buf->storage_buffer && buf->buffer_descriptor_set) {
+        vk_log(LOG_INFO, "draw_view_single: using buffer_blit path, width=%d height=%d stride=%u",
+               buf->width, buf->height, buf->stride);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk->buffer_blit.pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                vk->buffer_blit.layout, 0, 1,
+                                &buf->buffer_descriptor_set, 0, NULL);
+
+        // Buffer blit uses stride-aware sampling via push constants
+        struct {
+            int32_t width;
+            int32_t height;
+            int32_t stride;
+            int32_t swap_colors;
+            int32_t src_x;
+            int32_t src_y;
+            int32_t src_w;
+            int32_t src_h;
+        } pc = {
+            .width = buf->width,
+            .height = buf->height,
+            .stride = (int32_t)buf->stride,
+            .swap_colors = vk->dual_gpu ? 1 : 0,  // Try swapping for dual GPU
+            .src_x = 0,
+            .src_y = 0,
+            .src_w = buf->width,
+            .src_h = buf->height,
         };
-        vkCmdSetViewport(cmd, 0, 1, &viewport);
 
-        // Scissor to window bounds
-        VkRect2D scissor = {
-            .offset = { 0, 0 },
-            .extent = vk->swapchain.extent,
-        };
-        vkCmdSetScissor(cmd, 0, 1, &scissor);
-
-        // Prepare push constants
-        struct mirror_push_constants pc = {
-            .game_width = capture->width,
-            .game_height = capture->height,
-            .game_stride = capture->stride,
-            .src_x = mirror->src.x,
-            .src_y = mirror->src.y,
-            .src_w = mirror->src.width,
-            .src_h = mirror->src.height,
-            .color_key_enabled = mirror->color_key_enabled ? 1 : 0,
-            .key_r = ((mirror->color_key_input >> 16) & 0xFF) / 255.0f,
-            .key_g = ((mirror->color_key_input >> 8) & 0xFF) / 255.0f,
-            .key_b = (mirror->color_key_input & 0xFF) / 255.0f,
-            .out_r = ((mirror->color_key_output >> 16) & 0xFF) / 255.0f,
-            .out_g = ((mirror->color_key_output >> 8) & 0xFF) / 255.0f,
-            .out_b = (mirror->color_key_output & 0xFF) / 255.0f,
-            .tolerance = mirror->color_key_tolerance,
-        };
-
-        vkCmdPushConstants(cmd, vk->mirror_pipeline.layout, VK_SHADER_STAGE_FRAGMENT_BIT,
+        vkCmdPushConstants(cmd, vk->buffer_blit.layout, VK_SHADER_STAGE_FRAGMENT_BIT,
                            0, sizeof(pc), &pc);
         vkCmdDraw(cmd, 6, 1, 0, 0);
+    } else if (buf->descriptor_set) {
+        // Fallback to image path (no stride mismatch or single GPU)
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk->blit_pipeline.pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                vk->blit_pipeline.layout, 0, 1,
+                                &buf->descriptor_set, 0, NULL);
+
+        // Set push constants for blit shader
+        int32_t swap_colors = vk->dual_gpu ? 1 : 0;
+        vkCmdPushConstants(cmd, vk->blit_pipeline.layout, VK_SHADER_STAGE_FRAGMENT_BIT,
+                           0, sizeof(int32_t), &swap_colors);
+        vkCmdDraw(cmd, 6, 1, 0, 0);
+    } else {
+        vk_log(LOG_WARN, "draw_view_single: no valid descriptor set");
     }
 }
 
 static void
-draw_images(struct server_vk *vk, VkCommandBuffer cmd) {
-    if (wl_list_empty(&vk->images)) {
-        return;  // No images to draw
+draw_sorted_objects(struct server_vk *vk, VkCommandBuffer cmd) {
+    // Collect all enabled objects
+    size_t count = 0;
+    struct vk_mirror *m;
+    wl_list_for_each(m, &vk->mirrors, link) { if (m->enabled) count++; }
+    struct vk_image *i;
+    wl_list_for_each(i, &vk->images, link) { if (i->enabled) count++; }
+    struct vk_text *t;
+    wl_list_for_each(t, &vk->texts, link) { if (t->enabled) count++; }
+    struct vk_view *v;
+    wl_list_for_each(v, &vk->views, link) { if (v->enabled && v->current_buffer) count++; }
+
+    if (count == 0) return;
+
+    struct render_item *items = malloc(count * sizeof(*items));
+    if (!items) return;
+
+    size_t idx = 0;
+    wl_list_for_each(m, &vk->mirrors, link) {
+        if (m->enabled) items[idx++] = (struct render_item){ .depth = m->depth, .type = ITEM_MIRROR, .obj = m };
+    }
+    wl_list_for_each(i, &vk->images, link) {
+        if (i->enabled) items[idx++] = (struct render_item){ .depth = i->depth, .type = ITEM_IMAGE, .obj = i };
+    }
+    wl_list_for_each(t, &vk->texts, link) {
+        if (t->enabled) items[idx++] = (struct render_item){ .depth = t->depth, .type = ITEM_TEXT, .obj = t };
+    }
+    wl_list_for_each(v, &vk->views, link) {
+        if (v->enabled && v->current_buffer) items[idx++] = (struct render_item){ .depth = v->depth, .type = ITEM_VIEW, .obj = v };
     }
 
-    // Bind image pipeline
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk->image_pipeline.pipeline);
+    qsort(items, count, sizeof(*items), compare_render_items);
 
-    VkDeviceSize offset = 0;
-    vkCmdBindVertexBuffers(cmd, 0, 1, &vk->quad_vertex_buffer, &offset);
+    // Draw sorted items
+    VkPipeline last_pipeline = VK_NULL_HANDLE;
+    struct vk_buffer *capture = vk->capture.current;
 
-    struct vk_image *image;
-    wl_list_for_each(image, &vk->images, link) {
-        if (!image->enabled || image->descriptor_set == VK_NULL_HANDLE) {
-            continue;
+    for (size_t k = 0; k < count; k++) {
+        struct render_item *item = &items[k];
+        switch (item->type) {
+        case ITEM_MIRROR:
+            if (last_pipeline != vk->mirror_pipeline.pipeline) {
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk->mirror_pipeline.pipeline);
+                // Mirrors rely on capture buffer descriptor
+                if (capture && capture->storage_buffer && capture->buffer_descriptor_set) {
+                    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                            vk->mirror_pipeline.layout, 0, 1,
+                                            &capture->buffer_descriptor_set, 0, NULL);
+                }
+                // Bind quad vertex buffer (mirrors use shared quad)
+                VkDeviceSize offset = 0;
+                vkCmdBindVertexBuffers(cmd, 0, 1, &vk->quad_vertex_buffer, &offset);
+                last_pipeline = vk->mirror_pipeline.pipeline;
+            }
+            draw_mirror_single(vk, cmd, item->obj);
+            break;
+
+        case ITEM_IMAGE:
+            if (last_pipeline != vk->image_pipeline.pipeline) {
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk->image_pipeline.pipeline);
+                last_pipeline = vk->image_pipeline.pipeline;
+            }
+            draw_image_single(vk, cmd, item->obj);
+            break;
+
+        case ITEM_TEXT:
+            if (last_pipeline != vk->text_vk_pipeline.pipeline) {
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk->text_vk_pipeline.pipeline);
+                last_pipeline = vk->text_vk_pipeline.pipeline;
+            }
+            draw_text_single(vk, cmd, item->obj);
+            break;
+
+        case ITEM_VIEW:
+            draw_view_single(vk, cmd, item->obj);
+            last_pipeline = VK_NULL_HANDLE;
+            break;
         }
-
-        // Bind this image's descriptor set
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                vk->image_pipeline.layout, 0, 1,
-                                &image->descriptor_set, 0, NULL);
-
-        // Set viewport for this image's destination
-        VkViewport viewport = {
-            .x = (float)image->dst.x,
-            .y = (float)image->dst.y,
-            .width = (float)image->dst.width,
-            .height = (float)image->dst.height,
-            .minDepth = 0.0f,
-            .maxDepth = 1.0f,
-        };
-        vkCmdSetViewport(cmd, 0, 1, &viewport);
-
-        // Scissor to window bounds
-        VkRect2D scissor = {
-            .offset = { 0, 0 },
-            .extent = vk->swapchain.extent,
-        };
-        vkCmdSetScissor(cmd, 0, 1, &scissor);
-
-        vkCmdDraw(cmd, 6, 1, 0, 0);
     }
+
+    free(items);
 }
 
 bool
 server_vk_begin_frame(struct server_vk *vk) {
-    // Check if we have valid capture data before proceeding
-    // This prevents presenting black frames when nothing can be drawn
     struct vk_buffer *capture = vk->capture.current;
-    if (!capture) {
-        return false;  // Nothing to draw
-    }
-    bool has_buffer_path = capture->storage_buffer && capture->buffer_descriptor_set;
-    bool has_image_path = capture->descriptor_set != VK_NULL_HANDLE;
-    if (!has_buffer_path && !has_image_path) {
-        return false;  // No valid render path available
+    bool has_capture = false;
+    if (capture) {
+        bool has_buffer_path = capture->storage_buffer && capture->buffer_descriptor_set;
+        bool has_image_path = capture->descriptor_set != VK_NULL_HANDLE;
+        has_capture = has_buffer_path || has_image_path;
+
+        // Try to swap optimal buffers if async copy is ready.
+        if (vk->async_pipelining_enabled && capture->async_optimal_valid) {
+            try_swap_optimal_buffers(vk, capture);
+        }
     }
 
-    // Check if previous frame is finished (non-blocking)
-    if (vkGetFenceStatus(vk->device, vk->in_flight[vk->current_frame]) != VK_SUCCESS) {
-        return false; // Skip frame if GPU is busy
+    // If there is no capture buffer, we can still render overlays (proxy_game mode).
+    bool has_anything = has_capture;
+    if (!has_anything) {
+        struct vk_image *img;
+        wl_list_for_each(img, &vk->images, link) {
+            if (img->enabled) {
+                has_anything = true;
+                break;
+            }
+        }
     }
+    if (!has_anything) {
+        struct vk_text *txt;
+        wl_list_for_each(txt, &vk->texts, link) {
+            if (txt->enabled) {
+                has_anything = true;
+                break;
+            }
+        }
+    }
+    if (!has_anything) {
+        struct vk_view *v;
+        wl_list_for_each(v, &vk->views, link) {
+            if (v->enabled && v->current_buffer) {
+                has_anything = true;
+                break;
+            }
+        }
+    }
+    if (!has_anything) {
+        return false;
+    }
+
+    // Wait for the previous frame on this slot to finish (avoid dropping frames)
+    vkWaitForFences(vk->device, 1, &vk->in_flight[vk->current_frame], VK_TRUE, UINT64_MAX);
     // vkResetFences moved to after acquire
 
     // Acquire next swapchain image (non-blocking)
@@ -2464,7 +3669,7 @@ server_vk_begin_frame(struct server_vk *vk) {
     vkBeginCommandBuffer(cmd, &begin_info);
 
     // Perform dma-buf sync and image/buffer transition for captured buffer
-    if (vk->capture.current && vk->capture.current->dmabuf_fd >= 0) {
+    if (has_capture && vk->capture.current && vk->capture.current->dmabuf_fd >= 0) {
         // Kernel-level sync: wait for Intel GPU to finish writing
         // dmabuf_sync_start_read(vk->capture.current->dmabuf_fd);
 
@@ -2476,8 +3681,8 @@ server_vk_begin_frame(struct server_vk *vk) {
         }
     }
 
-    // Begin render pass
-    VkClearValue clear_value = { .color = {{ 0.0f, 0.0f, 0.0f, 1.0f }} };
+    // Begin render pass with transparent clear color (for background visibility)
+    VkClearValue clear_value = { .color = {{ 0.0f, 0.0f, 0.0f, 0.0f }} };
 
     VkRenderPassBeginInfo rp_info = {
         .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
@@ -2493,18 +3698,13 @@ server_vk_begin_frame(struct server_vk *vk) {
 
     vkCmdBeginRenderPass(cmd, &rp_info, VK_SUBPASS_CONTENTS_INLINE);
 
-    // Draw the captured frame centered in window
-    // Note: draw_captured_frame won't fail here since we validated capture in begin_frame
-    draw_captured_frame(vk, cmd);
+    // Draw the captured frame centered in window (Game Background)
+    if (has_capture) {
+        draw_captured_frame(vk, cmd);
+    }
 
-    // Draw mirrors on top of the game
-    draw_mirrors(vk, cmd);
-
-    // Draw images on top of mirrors
-    draw_images(vk, cmd);
-
-    // Draw text on top of everything
-    draw_texts(vk, cmd);
+    // Draw all overlays sorted by depth (Mirrors, Images, Text)
+    draw_sorted_objects(vk, cmd);
 
     return true;
 }
@@ -2539,7 +3739,8 @@ server_vk_end_frame(struct server_vk *vk) {
 
     wait_semaphores[0] = vk->image_available[vk->current_frame];
 
-    if (pfn_vkImportSemaphoreFdKHR && vk->capture.surface && vk->capture.surface->syncobj) {
+    if (!vk->disable_capture_sync_wait &&
+        pfn_vkImportSemaphoreFdKHR && vk->capture.surface && vk->capture.surface->syncobj) {
         struct server_drm_syncobj_surface *sync = vk->capture.surface->syncobj;
         if (sync->acquire.fd != -1) {
             if (sync->vk_sem == VK_NULL_HANDLE) {
@@ -2584,6 +3785,14 @@ server_vk_end_frame(struct server_vk *vk) {
         .waitSemaphoreValueCount = wait_count,
         .pWaitSemaphoreValues = wait_values,
     };
+    if (vk->disable_capture_sync_wait && wait_count == 1) {
+        // Optional warning when explicit sync is disabled (dual-GPU tear risk)
+        static bool warned = false;
+        if (!warned) {
+            vk_log(LOG_WARN, "capture sync wait disabled (WAYWALL_DISABLE_CAPTURE_SYNC_WAIT set) - may improve FPS but risk tearing");
+            warned = true;
+        }
+    }
 
     VkSemaphore signal_semaphores[2];
     uint64_t signal_values[2] = {0, 0};
@@ -2592,7 +3801,8 @@ server_vk_end_frame(struct server_vk *vk) {
     signal_semaphores[0] = vk->render_finished[vk->current_frame];
 
     // Handle explicit release (Signal)
-    if (pfn_vkImportSemaphoreFdKHR && vk->capture.surface && vk->capture.surface->syncobj) {
+    if (!vk->disable_capture_sync_wait &&
+        pfn_vkImportSemaphoreFdKHR && vk->capture.surface && vk->capture.surface->syncobj) {
         struct server_drm_syncobj_surface *sync = vk->capture.surface->syncobj;
         if (sync->release.fd != -1) {
             if (sync->vk_sem_release == VK_NULL_HANDLE) {
@@ -2661,6 +3871,20 @@ server_vk_end_frame(struct server_vk *vk) {
 
     vkQueuePresentKHR(vk->present_queue, &present_info);
 
+    // FPS logging (every 100 ms)
+    vk->fps_frame_count++;
+    uint64_t now = now_ms();
+    uint64_t delta = now - vk->fps_last_time_ms;
+    if (delta >= 100) {
+        double fps = (double)vk->fps_frame_count * 1000.0 / (double)delta;
+        int32_t cap_w = 0, cap_h = 0;
+        server_vk_get_capture_size(vk, &cap_w, &cap_h);
+        vk_log(LOG_INFO, "FPS: %.1f (capture=%dx%d, swap=%ux%u)",
+               fps, cap_w, cap_h, vk->swapchain.extent.width, vk->swapchain.extent.height);
+        vk->fps_frame_count = 0;
+        vk->fps_last_time_ms = now;
+    }
+
     vk->current_frame = (vk->current_frame + 1) % VK_MAX_FRAMES_IN_FLIGHT;
 }
 
@@ -2675,12 +3899,34 @@ vk_buffer_destroy(struct vk_buffer *buffer) {
 
     struct server_vk *vk = buffer->vk;
 
+    for (uint32_t i = 0; i < buffer->export_count; i++) {
+        if (buffer->export_images[i]) {
+            vkDestroyImage(vk->device, buffer->export_images[i], NULL);
+            buffer->export_images[i] = VK_NULL_HANDLE;
+        }
+        if (buffer->export_memories[i]) {
+            vkFreeMemory(vk->device, buffer->export_memories[i], NULL);
+            buffer->export_memories[i] = VK_NULL_HANDLE;
+        }
+    }
+
+    // Clean up async double-buffered optimal first (if used)
+    // This must happen before freeing descriptor_set to avoid double-free
+    // since descriptor_set may point to one of optimal_descriptors[]
+    if (buffer->async_optimal_valid) {
+        destroy_double_buffered_optimal(vk, buffer);
+        // descriptor_set was pointing to optimal_descriptors, now freed
+        buffer->descriptor_set = VK_NULL_HANDLE;
+    }
+
     if (buffer->descriptor_set) {
         vkFreeDescriptorSets(vk->device, vk->descriptor_pool, 1, &buffer->descriptor_set);
     }
     if (buffer->buffer_descriptor_set) {
         vkFreeDescriptorSets(vk->device, vk->descriptor_pool, 1, &buffer->buffer_descriptor_set);
     }
+    // Clean up legacy optimal copy path
+    destroy_optimal_copy(vk, buffer);
     if (buffer->view) {
         vkDestroyImageView(vk->device, buffer->view, NULL);
     }
@@ -2708,6 +3954,166 @@ vk_buffer_destroy(struct vk_buffer *buffer) {
         wl_list_remove(&buffer->link);
     }
     free(buffer);
+}
+
+static bool
+vk_import_dmabuf_image(struct server_vk *vk, int32_t width, int32_t height, uint32_t drm_format,
+                       uint32_t stride, uint32_t offset, uint64_t modifier, int fd,
+                       VkImageUsageFlags usage, VkImage *out_image, VkDeviceMemory *out_memory,
+                       bool *out_prepared) {
+    *out_image = VK_NULL_HANDLE;
+    *out_memory = VK_NULL_HANDLE;
+    *out_prepared = false;
+
+    VkFormat format = drm_format_to_vk(drm_format);
+    if (format == VK_FORMAT_UNDEFINED) {
+        vk_log(LOG_ERROR, "unsupported DRM format for dmabuf image: 0x%x", drm_format);
+        return false;
+    }
+
+    bool use_modifier_path = modifier != DRM_FORMAT_MOD_INVALID && modifier != DRM_FORMAT_MOD_LINEAR;
+
+    VkResult result;
+    if (use_modifier_path) {
+        VkSubresourceLayout plane_layout = {
+            .offset = offset,
+            .rowPitch = stride,
+        };
+
+        VkImageDrmFormatModifierExplicitCreateInfoEXT mod_info = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT,
+            .drmFormatModifier = modifier,
+            .drmFormatModifierPlaneCount = 1,
+            .pPlaneLayouts = &plane_layout,
+        };
+
+        VkExternalMemoryImageCreateInfo ext_info_mod = {
+            .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+            .pNext = &mod_info,
+            .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+        };
+
+        VkImageCreateInfo image_info_mod = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+            .pNext = &ext_info_mod,
+            .imageType = VK_IMAGE_TYPE_2D,
+            .format = format,
+            .extent = { (uint32_t)width, (uint32_t)height, 1 },
+            .mipLevels = 1,
+            .arrayLayers = 1,
+            .samples = VK_SAMPLE_COUNT_1_BIT,
+            .tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
+            .usage = usage,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        };
+
+        result = vkCreateImage(vk->device, &image_info_mod, NULL, out_image);
+        if (result != VK_SUCCESS) {
+            vk_log(LOG_ERROR, "failed to create dmabuf VkImage (modifier path): %d", result);
+            return false;
+        }
+    } else {
+        VkExternalMemoryImageCreateInfo ext_info = {
+            .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+            .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+        };
+
+        VkImageCreateInfo image_info = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+            .pNext = &ext_info,
+            .imageType = VK_IMAGE_TYPE_2D,
+            .format = format,
+            .extent = { (uint32_t)width, (uint32_t)height, 1 },
+            .mipLevels = 1,
+            .arrayLayers = 1,
+            .samples = VK_SAMPLE_COUNT_1_BIT,
+            .tiling = VK_IMAGE_TILING_LINEAR,
+            .usage = usage,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            .initialLayout = VK_IMAGE_LAYOUT_PREINITIALIZED,
+        };
+
+        result = vkCreateImage(vk->device, &image_info, NULL, out_image);
+        if (result != VK_SUCCESS) {
+            vk_log(LOG_ERROR, "failed to create dmabuf VkImage (linear): %d", result);
+            return false;
+        }
+
+        VkImageSubresource subres = {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .mipLevel = 0,
+            .arrayLayer = 0,
+        };
+        VkSubresourceLayout vk_layout;
+        vkGetImageSubresourceLayout(vk->device, *out_image, &subres, &vk_layout);
+
+        if (vk_layout.rowPitch != stride) {
+            vkDestroyImage(vk->device, *out_image, NULL);
+            *out_image = VK_NULL_HANDLE;
+
+            uint32_t effective_width = stride / 4;
+            image_info.extent.width = effective_width;
+
+            result = vkCreateImage(vk->device, &image_info, NULL, out_image);
+            if (result != VK_SUCCESS) {
+                vk_log(LOG_ERROR, "failed to create stride-adjusted dmabuf VkImage: %d", result);
+                return false;
+            }
+        }
+    }
+
+    VkMemoryRequirements mem_reqs;
+    vkGetImageMemoryRequirements(vk->device, *out_image, &mem_reqs);
+
+    VkImportMemoryFdInfoKHR import_info = {
+        .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
+        .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+        .fd = dup(fd),
+    };
+    if (import_info.fd < 0) {
+        vk_log(LOG_ERROR, "failed to dup dmabuf fd");
+        vkDestroyImage(vk->device, *out_image, NULL);
+        *out_image = VK_NULL_HANDLE;
+        return false;
+    }
+
+    uint32_t memory_type = find_memory_type(vk, mem_reqs.memoryTypeBits, 0);
+    if (memory_type == UINT32_MAX) {
+        vk_log(LOG_ERROR, "no suitable memory type for dmabuf image");
+        close(import_info.fd);
+        vkDestroyImage(vk->device, *out_image, NULL);
+        *out_image = VK_NULL_HANDLE;
+        return false;
+    }
+
+    VkMemoryAllocateInfo alloc_info = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .pNext = &import_info,
+        .allocationSize = mem_reqs.size,
+        .memoryTypeIndex = memory_type,
+    };
+
+    result = vkAllocateMemory(vk->device, &alloc_info, NULL, out_memory);
+    if (result != VK_SUCCESS) {
+        vk_log(LOG_ERROR, "failed to allocate dmabuf memory: %d", result);
+        close(import_info.fd);
+        vkDestroyImage(vk->device, *out_image, NULL);
+        *out_image = VK_NULL_HANDLE;
+        return false;
+    }
+
+    result = vkBindImageMemory(vk->device, *out_image, *out_memory, 0);
+    if (result != VK_SUCCESS) {
+        vk_log(LOG_ERROR, "failed to bind dmabuf image memory: %d", result);
+        vkFreeMemory(vk->device, *out_memory, NULL);
+        *out_memory = VK_NULL_HANDLE;
+        vkDestroyImage(vk->device, *out_image, NULL);
+        *out_image = VK_NULL_HANDLE;
+        return false;
+    }
+
+    return true;
 }
 
 static uint32_t
@@ -2740,6 +4146,8 @@ on_parent_buffer_destroy(struct wl_listener *listener, void *data) {
     struct vk_buffer *vk_buf = wl_container_of(listener, vk_buf, on_parent_destroy);
     struct server_vk *vk = vk_buf->vk;
 
+    destroy_optimal_copy(vk, vk_buf);
+
     // If this is the current buffer, clear the reference
     if (vk->capture.current == vk_buf) {
         vk->capture.current = NULL;
@@ -2771,8 +4179,231 @@ vk_buffer_import(struct server_vk *vk, struct server_buffer *buffer) {
     vk_buffer->vk = vk;
     vk_buffer->parent = server_buffer_ref(buffer);
     vk_buffer->dmabuf_fd = data->planes[0].fd;
+    vk_buffer->source_prepared = false;
+
+    if (data->proxy_export && data->export_count > 0) {
+        vk_buffer->export_count = data->export_count;
+        if (vk_buffer->export_count > DMABUF_EXPORT_MAX) {
+            vk_buffer->export_count = DMABUF_EXPORT_MAX;
+        }
+
+        for (uint32_t i = 0; i < vk_buffer->export_count; i++) {
+            uint64_t exp_mod = ((uint64_t)data->exports[i].modifier_hi << 32) | data->exports[i].modifier_lo;
+            if (!vk_import_dmabuf_image(vk, data->width, data->height, data->format,
+                                        data->exports[i].stride, data->exports[i].offset, exp_mod,
+                                        data->exports[i].fd,
+                                        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                                        &vk_buffer->export_images[i], &vk_buffer->export_memories[i],
+                                        &vk_buffer->export_prepared[i])) {
+                vk_log(LOG_ERROR, "failed to import proxy export target %u", i);
+                goto fail;
+            }
+        }
+    }
 
     uint64_t modifier = ((uint64_t)data->modifier_hi << 32) | data->modifier_lo;
+    bool allow_modifiers = vk->allow_modifiers || getenv("WAYWALL_DMABUF_ALLOW_MODIFIERS") != NULL;
+    bool use_modifier_path = allow_modifiers &&
+                             data->num_planes == 1 &&
+                             modifier != DRM_FORMAT_MOD_INVALID &&
+                             modifier != DRM_FORMAT_MOD_LINEAR;
+
+    // ------------------------------------------------------------------------
+    // Modifier-based import (tiled) when allowed and modifier is non-linear.
+    // ------------------------------------------------------------------------
+    if (use_modifier_path) {
+        VkSubresourceLayout plane_layout = {
+            .offset = data->planes[0].offset,
+            .size = 0,
+            .rowPitch = data->planes[0].stride,
+            .arrayPitch = 0,
+            .depthPitch = 0,
+        };
+
+        VkImageDrmFormatModifierExplicitCreateInfoEXT mod_info = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT,
+            .drmFormatModifier = modifier,
+            .drmFormatModifierPlaneCount = 1,
+            .pPlaneLayouts = &plane_layout,
+        };
+
+        VkExternalMemoryImageCreateInfo ext_info_mod = {
+            .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+            .pNext = &mod_info,
+            .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+        };
+
+        VkImageCreateInfo image_info_mod = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+            .pNext = &ext_info_mod,
+            .imageType = VK_IMAGE_TYPE_2D,
+            .format = format,
+            .extent = { data->width, data->height, 1 },
+            .mipLevels = 1,
+            .arrayLayers = 1,
+            .samples = VK_SAMPLE_COUNT_1_BIT,
+            .tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
+            .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        };
+
+        vk_log(LOG_INFO, "MODIFIER dma-buf import: %dx%d, stride=%d, modifier=0x%"PRIx64", format=0x%x",
+               data->width, data->height, data->planes[0].stride, modifier, data->format);
+
+        VkResult result = vkCreateImage(vk->device, &image_info_mod, NULL, &vk_buffer->image);
+        if (result == VK_SUCCESS) {
+            // Import dma-buf memory
+            VkMemoryFdPropertiesKHR fd_props = {
+                .sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR,
+            };
+
+            PFN_vkGetMemoryFdPropertiesKHR vkGetMemoryFdPropertiesKHR =
+                (PFN_vkGetMemoryFdPropertiesKHR)vkGetDeviceProcAddr(vk->device, "vkGetMemoryFdPropertiesKHR");
+
+            int fd_dup = dup(vk_buffer->dmabuf_fd);
+
+            result = vkGetMemoryFdPropertiesKHR(vk->device,
+                                                VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+                                                fd_dup, &fd_props);
+            if (result != VK_SUCCESS) {
+                vk_log(LOG_ERROR, "failed to get dma-buf memory properties: %d", result);
+                close(fd_dup);
+                goto fail;
+            }
+
+            VkMemoryRequirements mem_reqs;
+            vkGetImageMemoryRequirements(vk->device, vk_buffer->image, &mem_reqs);
+
+            // Dedicated allocation for imported images
+            VkMemoryDedicatedAllocateInfo dedicated_info = {
+                .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
+                .image = vk_buffer->image,
+                .buffer = VK_NULL_HANDLE,
+            };
+
+            VkImportMemoryFdInfoKHR import_info = {
+                .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
+                .pNext = &dedicated_info,
+                .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+                .fd = fd_dup,
+            };
+
+            uint32_t compatible_bits = mem_reqs.memoryTypeBits & fd_props.memoryTypeBits;
+            uint32_t mem_type_index = find_memory_type(vk, compatible_bits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            if (mem_type_index == UINT32_MAX) {
+                mem_type_index = find_memory_type(vk, compatible_bits, 0);
+            }
+            if (mem_type_index == UINT32_MAX && fd_props.memoryTypeBits != 0) {
+                mem_type_index = find_memory_type(vk, fd_props.memoryTypeBits, 0);
+            }
+
+            VkMemoryAllocateInfo alloc_info = {
+                .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                .pNext = &import_info,
+                .allocationSize = mem_reqs.size,
+                .memoryTypeIndex = mem_type_index,
+            };
+
+            if (alloc_info.memoryTypeIndex == UINT32_MAX) {
+                vk_log(LOG_ERROR, "no suitable memory type for dma-buf import (modifier path)");
+                close(fd_dup);
+                goto fail;
+            }
+
+            result = vkAllocateMemory(vk->device, &alloc_info, NULL, &vk_buffer->memory);
+            if (result != VK_SUCCESS) {
+                vk_log(LOG_ERROR, "failed to allocate memory for dma-buf (modifier path): %d", result);
+                goto fail;
+            }
+
+            result = vkBindImageMemory(vk->device, vk_buffer->image, vk_buffer->memory, 0);
+            if (result != VK_SUCCESS) {
+                vk_log(LOG_ERROR, "failed to bind dma-buf memory (modifier path): %d", result);
+                goto fail;
+            }
+
+            // Create image view
+            VkImageViewCreateInfo view_info = {
+                .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+                .image = vk_buffer->image,
+                .viewType = VK_IMAGE_VIEW_TYPE_2D,
+                .format = format,
+                .components = {
+                    .r = VK_COMPONENT_SWIZZLE_IDENTITY,
+                    .g = VK_COMPONENT_SWIZZLE_IDENTITY,
+                    .b = VK_COMPONENT_SWIZZLE_IDENTITY,
+                    .a = VK_COMPONENT_SWIZZLE_IDENTITY,
+                },
+                .subresourceRange = {
+                    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .baseMipLevel = 0,
+                    .levelCount = 1,
+                    .baseArrayLayer = 0,
+                    .layerCount = 1,
+                },
+            };
+
+            result = vkCreateImageView(vk->device, &view_info, NULL, &vk_buffer->view);
+            if (result != VK_SUCCESS) {
+                vk_log(LOG_ERROR, "failed to create image view for dma-buf (modifier path): %d", result);
+                goto fail;
+            }
+
+            vk_buffer->width = data->width;
+            vk_buffer->height = data->height;
+
+            // Allocate descriptor set for this texture
+            VkDescriptorSetAllocateInfo desc_alloc_info = {
+                .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                .descriptorPool = vk->descriptor_pool,
+                .descriptorSetCount = 1,
+                .pSetLayouts = &vk->blit_pipeline.descriptor_layout,
+            };
+
+            result = vkAllocateDescriptorSets(vk->device, &desc_alloc_info, &vk_buffer->descriptor_set);
+            if (result != VK_SUCCESS) {
+                vk_log(LOG_ERROR, "failed to allocate descriptor set (modifier path): %d", result);
+                goto fail;
+            }
+
+            VkDescriptorImageInfo image_desc = {
+                .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                .imageView = vk_buffer->view,
+                .sampler = vk->sampler,
+            };
+
+            VkWriteDescriptorSet desc_write = {
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = vk_buffer->descriptor_set,
+                .dstBinding = 0,
+                .dstArrayElement = 0,
+                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .descriptorCount = 1,
+                .pImageInfo = &image_desc,
+            };
+
+            vkUpdateDescriptorSets(vk->device, 1, &desc_write, 0, NULL);
+
+            vk_log(LOG_INFO, "imported dma-buf (modifier path): %dx%d, format=0x%x, modifier=0x%llx",
+                   data->width, data->height, data->format, (unsigned long long)modifier);
+
+            // Listen for parent buffer destruction to clean up
+            vk_buffer->on_parent_destroy.notify = on_parent_buffer_destroy;
+            wl_signal_add(&buffer->events.resource_destroy, &vk_buffer->on_parent_destroy);
+
+            wl_list_insert(&vk->capture.buffers, &vk_buffer->link);
+            return vk_buffer;
+        } else {
+            vk_log(LOG_WARN, "modifier import failed (%d), falling back to LINEAR path", result);
+            vkDestroyImage(vk->device, vk_buffer->image, NULL);
+            vk_buffer->image = VK_NULL_HANDLE;
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // Legacy LINEAR import path (stride fix + optional storage buffer).
+    // ------------------------------------------------------------------------
 
     // NATIVE GPU-to-GPU dma-buf import via VK_EXT_external_memory_dma_buf
     // Use VK_IMAGE_TILING_LINEAR for cross-GPU sharing - direct VRAM access via ReBAR
@@ -3058,6 +4689,152 @@ vk_buffer_import(struct server_vk *vk, struct server_buffer *buffer) {
     vk_log(LOG_INFO, "imported dma-buf: %dx%d, format=0x%x, modifier=0x%llx",
            data->width, data->height, data->format, (unsigned long long)modifier);
 
+    // Attempt to create optimal-tiling copy to avoid linear peer-read throttling
+    if (!use_modifier_path && vk_buffer->view) {
+        VkDescriptorSet linear_desc = vk_buffer->descriptor_set;
+
+        // Use async pipelined double-buffering if enabled, otherwise use synchronous copy
+        if (vk->async_pipelining_enabled) {
+            if (create_double_buffered_optimal(vk, vk_buffer)) {
+                // Use the first buffer's descriptor initially
+                vk_buffer->descriptor_set = vk_buffer->optimal_descriptors[vk_buffer->optimal_read_index];
+                vk_log(LOG_INFO, "created double-buffered optimal for async pipelining");
+                // Free linear descriptor set to avoid leaks
+                if (linear_desc) {
+                    vkFreeDescriptorSets(vk->device, vk->descriptor_pool, 1, &linear_desc);
+                }
+
+                // Perform initial synchronous copy to populate first buffer
+                // We'll do a simple blocking copy here to get the first frame ready
+                VkCommandBufferAllocateInfo alloc_info_init = {
+                    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+                    .commandPool = vk->command_pool,
+                    .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+                    .commandBufferCount = 1,
+                };
+                VkCommandBuffer init_cmd = VK_NULL_HANDLE;
+                if (vkAllocateCommandBuffers(vk->device, &alloc_info_init, &init_cmd) == VK_SUCCESS) {
+                    VkCommandBufferBeginInfo begin_info_init = {
+                        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+                    };
+                    vkBeginCommandBuffer(init_cmd, &begin_info_init);
+
+                    // Copy to first optimal buffer
+                    VkImageMemoryBarrier init_barriers[2] = {
+                        {
+                            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                            .srcAccessMask = 0,
+                            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+                            .oldLayout = VK_IMAGE_LAYOUT_PREINITIALIZED,
+                            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                            .image = vk_buffer->image,
+                            .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = 1},
+                        },
+                        {
+                            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                            .srcAccessMask = 0,
+                            .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                            .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                            .image = vk_buffer->optimal_images[0],
+                            .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = 1},
+                        },
+                    };
+                    vkCmdPipelineBarrier(init_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 2, init_barriers);
+
+                    VkImageCopy init_region = {
+                        .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                        .srcOffset = {0, 0, 0},
+                        .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                        .dstOffset = {0, 0, 0},
+                        .extent = {(uint32_t)vk_buffer->width, (uint32_t)vk_buffer->height, 1},
+                    };
+                    vkCmdCopyImage(init_cmd, vk_buffer->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                   vk_buffer->optimal_images[0], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &init_region);
+
+                    VkImageMemoryBarrier init_post = {
+                        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+                        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                        .image = vk_buffer->optimal_images[0],
+                        .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = 1},
+                    };
+                    vkCmdPipelineBarrier(init_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &init_post);
+
+                    vkEndCommandBuffer(init_cmd);
+                    VkSubmitInfo init_submit = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &init_cmd};
+                    vkQueueSubmit(vk->graphics_queue, 1, &init_submit, VK_NULL_HANDLE);
+                    vkQueueWaitIdle(vk->graphics_queue);
+                    vkFreeCommandBuffers(vk->device, vk->command_pool, 1, &init_cmd);
+                    vk_log(LOG_INFO, "initial sync copy to optimal buffer complete");
+                }
+            } else {
+                vk_buffer->descriptor_set = linear_desc;
+            }
+        } else {
+            // Legacy synchronous optimal copy path
+            if (create_optimal_copy(vk, vk_buffer)) {
+                // Record descriptor set for optimal view
+                VkDescriptorSetAllocateInfo desc_alloc_info_opt = {
+                    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                    .descriptorPool = vk->descriptor_pool,
+                    .descriptorSetCount = 1,
+                    .pSetLayouts = &vk->blit_pipeline.descriptor_layout,
+                };
+
+                VkDescriptorSet opt_desc = VK_NULL_HANDLE;
+                if (vkAllocateDescriptorSets(vk->device, &desc_alloc_info_opt, &opt_desc) == VK_SUCCESS) {
+                    VkDescriptorImageInfo opt_image_desc = {
+                        .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                        .imageView = vk_buffer->optimal_view,
+                        .sampler = vk->sampler,
+                    };
+
+                    VkWriteDescriptorSet opt_write = {
+                        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                        .dstSet = opt_desc,
+                        .dstBinding = 0,
+                        .dstArrayElement = 0,
+                        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                        .descriptorCount = 1,
+                        .pImageInfo = &opt_image_desc,
+                    };
+
+                    vkUpdateDescriptorSets(vk->device, 1, &opt_write, 0, NULL);
+
+                    if (copy_to_optimal(vk, vk_buffer)) {
+                        // Prefer optimal descriptor
+                        vk_buffer->descriptor_set = opt_desc;
+                        vk_log(LOG_INFO, "created optimal-tiling copy for dma-buf import");
+                        // Free linear descriptor set to avoid leaks
+                        if (linear_desc) {
+                            vkFreeDescriptorSets(vk->device, vk->descriptor_pool, 1, &linear_desc);
+                        }
+                    } else {
+                        // Copy failed, keep linear descriptor
+                        vkFreeDescriptorSets(vk->device, vk->descriptor_pool, 1, &opt_desc);
+                        destroy_optimal_copy(vk, vk_buffer);
+                        vk_buffer->descriptor_set = linear_desc;
+                    }
+                } else {
+                    destroy_optimal_copy(vk, vk_buffer);
+                    vk_buffer->descriptor_set = linear_desc;
+                }
+            } else {
+                vk_buffer->descriptor_set = linear_desc;
+            }
+        }
+    }
+
     // Listen for parent buffer destruction to clean up
     vk_buffer->on_parent_destroy.notify = on_parent_buffer_destroy;
     wl_signal_add(&buffer->events.resource_destroy, &vk_buffer->on_parent_destroy);
@@ -3073,6 +4850,145 @@ fail:
 // ============================================================================
 // Event Handlers
 // ============================================================================
+
+static bool
+vk_proxy_copy_to_export(struct server_vk *vk, struct vk_buffer *src, struct server_dmabuf_data *data,
+                        uint32_t export_index) {
+    if (export_index >= src->export_count || export_index >= data->export_count) {
+        return false;
+    }
+
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    VkFence fence = VK_NULL_HANDLE;
+    uint32_t slot = UINT32_MAX;
+
+    for (uint32_t attempt = 0; attempt < DMABUF_EXPORT_MAX; attempt++) {
+        uint32_t idx = (vk->proxy_copy.index + attempt) % DMABUF_EXPORT_MAX;
+        if (vkGetFenceStatus(vk->device, vk->proxy_copy.fences[idx]) == VK_SUCCESS) {
+            slot = idx;
+            break;
+        }
+    }
+    if (slot == UINT32_MAX) {
+        vk_log(LOG_WARN, "proxy copy: no available command slot (dropping frame)");
+        return false;
+    }
+
+    vk->proxy_copy.index = (slot + 1) % DMABUF_EXPORT_MAX;
+    cmd = vk->proxy_copy.command_buffers[slot];
+    fence = vk->proxy_copy.fences[slot];
+
+    vkResetFences(vk->device, 1, &fence);
+    vkResetCommandBuffer(cmd, 0);
+
+    VkCommandBufferBeginInfo begin_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
+    if (vkBeginCommandBuffer(cmd, &begin_info) != VK_SUCCESS) {
+        vk_log(LOG_ERROR, "proxy copy: vkBeginCommandBuffer failed");
+        return false;
+    }
+
+    VkImageMemoryBarrier barriers[2] = {0};
+
+    barriers[0] = (VkImageMemoryBarrier){
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = src->source_prepared ? VK_ACCESS_TRANSFER_READ_BIT : 0,
+        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+        .oldLayout = src->source_prepared ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED,
+        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = src->image,
+        .subresourceRange = {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .baseMipLevel = 0,
+            .levelCount = 1,
+            .baseArrayLayer = 0,
+            .layerCount = 1,
+        },
+    };
+
+    barriers[1] = (VkImageMemoryBarrier){
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = src->export_prepared[export_index] ? VK_ACCESS_TRANSFER_WRITE_BIT : 0,
+        .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .oldLayout = src->export_prepared[export_index] ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED,
+        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = src->export_images[export_index],
+        .subresourceRange = {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .baseMipLevel = 0,
+            .levelCount = 1,
+            .baseArrayLayer = 0,
+            .layerCount = 1,
+        },
+    };
+
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                         0, NULL, 0, NULL, 2, barriers);
+
+    VkImageCopy copy = {
+        .srcSubresource = { .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .mipLevel = 0, .baseArrayLayer = 0, .layerCount = 1 },
+        .dstSubresource = { .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .mipLevel = 0, .baseArrayLayer = 0, .layerCount = 1 },
+        .extent = { (uint32_t)data->width, (uint32_t)data->height, 1 },
+    };
+    vkCmdCopyImage(cmd, src->image, VK_IMAGE_LAYOUT_GENERAL,
+                   src->export_images[export_index], VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
+
+    VkImageMemoryBarrier dst_release = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask = 0,
+        .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = src->export_images[export_index],
+        .subresourceRange = {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .baseMipLevel = 0,
+            .levelCount = 1,
+            .baseArrayLayer = 0,
+            .layerCount = 1,
+        },
+    };
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0,
+                         0, NULL, 0, NULL, 1, &dst_release);
+
+    if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
+        vk_log(LOG_ERROR, "proxy copy: vkEndCommandBuffer failed");
+        return false;
+    }
+
+    VkSubmitInfo submit = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &cmd,
+    };
+
+    VkResult res = vkQueueSubmit(vk->graphics_queue, 1, &submit, fence);
+    if (res != VK_SUCCESS) {
+        vk_log(LOG_ERROR, "proxy copy: vkQueueSubmit failed: %d", res);
+        return false;
+    }
+
+    // Ensure the export dmabuf contents are complete before Wayland commits the wl_buffer.
+    // This avoids presenting partially-copied frames when the host compositor samples it.
+    // This wait is CPU-blocking, but it avoids the swapchain-present timing stall that caps FPS.
+    res = vkWaitForFences(vk->device, 1, &fence, VK_TRUE, UINT64_MAX);
+    if (res != VK_SUCCESS) {
+        vk_log(LOG_ERROR, "proxy copy: vkWaitForFences failed: %d", res);
+        return false;
+    }
+
+    src->source_prepared = true;
+    src->export_prepared[export_index] = true;
+    return true;
+}
 
 static void
 on_surface_commit(struct wl_listener *listener, void *data) {
@@ -3102,6 +5018,77 @@ on_surface_commit(struct wl_listener *listener, void *data) {
     if (vk_buf) {
         vk->capture.current = vk_buf;
 
+        if (vk->proxy_game) {
+            struct server_dmabuf_data *data = buffer->data;
+            if (data && data->proxy_export && data->export_count > 0) {
+                uint32_t export_index = 0;
+                bool found = false;
+                for (uint32_t i = 0; i < data->export_count && i < DMABUF_EXPORT_MAX; i++) {
+                    if (!data->exports[i].busy) {
+                        export_index = i;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    export_index = 0;
+                }
+
+                data->exports[export_index].busy = true;
+                buffer->remote = data->exports[export_index].remote;
+                vk_buf->export_index = export_index;
+                (void)vk_proxy_copy_to_export(vk, vk_buf, data, export_index);
+            }
+
+            wl_signal_emit_mutable(&vk->events.frame, NULL);
+            return;
+        }
+
+        // Start async copy to optimal if pipelining is enabled
+        if (vk->async_pipelining_enabled && vk_buf->async_optimal_valid) {
+            start_async_copy_to_optimal(vk, vk_buf);
+        }
+
+        // Advance animated overlays (e.g., AVIF emotes) on frame ticks.
+        vk_update_animated_images(vk);
+
+        // Update all floating view buffers before rendering
+        struct vk_view *v;
+        wl_list_for_each(v, &vk->views, link) {
+            if (v->view && v->view->surface) {
+                struct server_buffer *view_buffer = server_surface_next_buffer(v->view->surface);
+                if (view_buffer) {
+                    // Find or import the buffer
+                    struct vk_buffer *vb = NULL;
+                    struct vk_buffer *it;
+                    wl_list_for_each(it, &vk->capture.buffers, link) {
+                        if (it->parent == view_buffer) {
+                            vb = it;
+                            break;
+                        }
+                    }
+                    if (!vb) {
+                        vb = vk_buffer_import(vk, view_buffer);
+                        if (vb) {
+                            vk_log(LOG_INFO, "imported floating view buffer: %dx%d", vb->width, vb->height);
+                        }
+                    }
+                    if (vb && v->current_buffer != vb) {
+                        v->current_buffer = vb;
+                        // Update geometry from buffer dimensions
+                        // Position at top-left corner (no margin)
+                        // TODO: Read anchor from config
+                        v->dst.x = 0;
+                        v->dst.y = 0;
+                        v->dst.width = vb->width;
+                        v->dst.height = vb->height;
+                        vk_log(LOG_INFO, "view buffer updated: pos=(%d,%d) size=(%d,%d)", 
+                               v->dst.x, v->dst.y, v->dst.width, v->dst.height);
+                    }
+                }
+            }
+        }
+
         // Render frame with Vulkan
         if (server_vk_begin_frame(vk)) {
             server_vk_end_frame(vk);
@@ -3109,11 +5096,6 @@ on_surface_commit(struct wl_listener *listener, void *data) {
     }
 
     wl_signal_emit_mutable(&vk->events.frame, NULL);
-
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    uint32_t time = ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-    server_surface_send_frame_done(vk->capture.surface, time);
 }
 
 static void
@@ -3188,7 +5170,6 @@ recreate_swapchain(struct server_vk *vk, uint32_t width, uint32_t height) {
         return false;
     }
 
-    vk_log(LOG_INFO, "recreated swapchain: %dx%d", width, height);
     return true;
 }
 
@@ -3202,6 +5183,32 @@ on_ui_resize(struct wl_listener *listener, void *data) {
     if (width > 0 && height > 0) {
         recreate_swapchain(vk, width, height);
     }
+}
+
+static void
+on_ui_refresh(struct wl_listener *listener, void *data) {
+    (void)data;
+    struct server_vk *vk = wl_container_of(listener, vk, on_ui_refresh);
+    vk->overlay_tick_ms = refresh_mhz_to_ms(vk->server->ui ? vk->server->ui->refresh_mhz : 0);
+
+    if (vk->overlay_tick) {
+        wl_event_source_timer_update(vk->overlay_tick, vk->overlay_tick_ms);
+    }
+}
+
+static int
+handle_overlay_tick(void *data) {
+    struct server_vk *vk = data;
+
+    if (server_vk_begin_frame(vk)) {
+        server_vk_end_frame(vk);
+    }
+
+    if (vk->overlay_tick) {
+        wl_event_source_timer_update(vk->overlay_tick, vk->overlay_tick_ms);
+    }
+
+    return 0;
 }
 
 // ============================================================================
@@ -3218,6 +5225,7 @@ server_vk_add_mirror(struct server_vk *vk, const struct vk_mirror_options *optio
     mirror->color_key_input = options->color_key_input;
     mirror->color_key_output = options->color_key_output;
     mirror->color_key_tolerance = options->color_key_tolerance > 0.0f ? options->color_key_tolerance : 0.1f;
+    mirror->depth = options->depth;
     mirror->enabled = true;
 
     wl_list_insert(&vk->mirrors, &mirror->link);
@@ -3264,6 +5272,555 @@ server_vk_mirror_set_enabled(struct vk_mirror *mirror, bool enabled) {
 // Image API
 // ============================================================================
 
+static struct vk_image *
+server_vk_add_rgba_image(struct server_vk *vk, const char *debug_name, uint32_t width, uint32_t height,
+                         const unsigned char *rgba, const struct vk_image_options *options) {
+    if (!rgba || width == 0 || height == 0) {
+        return NULL;
+    }
+
+    struct vk_image *image = zalloc(1, sizeof(*image));
+    image->width = (int32_t)width;
+    image->height = (int32_t)height;
+    image->dst = options->dst;
+    image->depth = options->depth;
+    image->enabled = true;
+    image->owns_descriptor_set = true;
+    image->owns_image = true;
+
+    vk_log(LOG_INFO, "loading image: %s (%ux%u)", debug_name ? debug_name : "(raw)", width, height);
+
+    VkImageCreateInfo image_ci = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .imageType = VK_IMAGE_TYPE_2D,
+        .format = VK_FORMAT_R8G8B8A8_UNORM,
+        .extent = { width, height, 1 },
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .tiling = VK_IMAGE_TILING_LINEAR,  // For direct CPU access
+        .usage = VK_IMAGE_USAGE_SAMPLED_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .initialLayout = VK_IMAGE_LAYOUT_PREINITIALIZED,
+    };
+
+    if (vkCreateImage(vk->device, &image_ci, NULL, &image->image) != VK_SUCCESS) {
+        free(image);
+        return NULL;
+    }
+
+    VkMemoryRequirements mem_reqs;
+    vkGetImageMemoryRequirements(vk->device, image->image, &mem_reqs);
+
+    uint32_t mem_type = find_memory_type(vk, mem_reqs.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (mem_type == UINT32_MAX) {
+        vkDestroyImage(vk->device, image->image, NULL);
+        free(image);
+        return NULL;
+    }
+
+    VkMemoryAllocateInfo alloc_info = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = mem_reqs.size,
+        .memoryTypeIndex = mem_type,
+    };
+    if (vkAllocateMemory(vk->device, &alloc_info, NULL, &image->memory) != VK_SUCCESS) {
+        vkDestroyImage(vk->device, image->image, NULL);
+        free(image);
+        return NULL;
+    }
+
+    vkBindImageMemory(vk->device, image->image, image->memory, 0);
+
+    void *mapped;
+    if (vkMapMemory(vk->device, image->memory, 0, mem_reqs.size, 0, &mapped) != VK_SUCCESS) {
+        vkFreeMemory(vk->device, image->memory, NULL);
+        vkDestroyImage(vk->device, image->image, NULL);
+        free(image);
+        return NULL;
+    }
+
+    VkImageSubresource subres = { .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT };
+    VkSubresourceLayout layout;
+    vkGetImageSubresourceLayout(vk->device, image->image, &subres, &layout);
+
+    const unsigned char *src = rgba;
+    unsigned char *dst = (unsigned char *)mapped + layout.offset;
+    size_t src_row_size = (size_t)width * 4;
+
+    for (uint32_t y = 0; y < height; y++) {
+        memcpy(dst, src, src_row_size);
+        src += src_row_size;
+        dst += layout.rowPitch;
+    }
+
+    vkUnmapMemory(vk->device, image->memory);
+
+    // Transition to shader-read layout
+    VkCommandBuffer cmd;
+    VkCommandBufferAllocateInfo cmd_alloc = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = vk->command_pool,
+        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+        .commandBufferCount = 1,
+    };
+    vkAllocateCommandBuffers(vk->device, &cmd_alloc, &cmd);
+
+    VkCommandBufferBeginInfo begin_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
+    vkBeginCommandBuffer(cmd, &begin_info);
+
+    VkImageMemoryBarrier barrier = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .oldLayout = VK_IMAGE_LAYOUT_PREINITIALIZED,
+        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = image->image,
+        .subresourceRange = {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .baseMipLevel = 0,
+            .levelCount = 1,
+            .baseArrayLayer = 0,
+            .layerCount = 1,
+        },
+        .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+    };
+
+    vkCmdPipelineBarrier(cmd,
+        VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+        0, 0, NULL, 0, NULL, 1, &barrier);
+
+    vkEndCommandBuffer(cmd);
+
+    VkSubmitInfo submit = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &cmd,
+    };
+    vkQueueSubmit(vk->graphics_queue, 1, &submit, VK_NULL_HANDLE);
+    vkQueueWaitIdle(vk->graphics_queue);
+    vkFreeCommandBuffers(vk->device, vk->command_pool, 1, &cmd);
+
+    VkImageViewCreateInfo view_ci = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .image = image->image,
+        .viewType = VK_IMAGE_VIEW_TYPE_2D,
+        .format = VK_FORMAT_R8G8B8A8_UNORM,
+        .subresourceRange = {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .baseMipLevel = 0,
+            .levelCount = 1,
+            .baseArrayLayer = 0,
+            .layerCount = 1,
+        },
+    };
+
+    if (vkCreateImageView(vk->device, &view_ci, NULL, &image->view) != VK_SUCCESS) {
+        vkFreeMemory(vk->device, image->memory, NULL);
+        vkDestroyImage(vk->device, image->image, NULL);
+        free(image);
+        return NULL;
+    }
+
+    VkDescriptorSetAllocateInfo ds_alloc = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = vk->descriptor_pool,
+        .descriptorSetCount = 1,
+        .pSetLayouts = &vk->image_pipeline.descriptor_layout,
+    };
+    if (vkAllocateDescriptorSets(vk->device, &ds_alloc, &image->descriptor_set) != VK_SUCCESS) {
+        vkDestroyImageView(vk->device, image->view, NULL);
+        vkFreeMemory(vk->device, image->memory, NULL);
+        vkDestroyImage(vk->device, image->image, NULL);
+        free(image);
+        return NULL;
+    }
+
+    VkDescriptorImageInfo img_info = {
+        .sampler = vk->sampler,
+        .imageView = image->view,
+        .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+    };
+
+    VkWriteDescriptorSet write = {
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .dstSet = image->descriptor_set,
+        .dstBinding = 0,
+        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+        .descriptorCount = 1,
+        .pImageInfo = &img_info,
+    };
+    vkUpdateDescriptorSets(vk->device, 1, &write, 0, NULL);
+
+    wl_list_insert(&vk->images, &image->link);
+    return image;
+}
+
+struct vk_atlas *
+server_vk_create_atlas(struct server_vk *vk, uint32_t width, const char *rgba_data, size_t rgba_len) {
+    if (!vk || width == 0) {
+        return NULL;
+    }
+
+    const unsigned char *bytes = NULL;
+    size_t pixel_len = 0;
+    uint32_t height = 0;
+    bool need_free = false;
+
+    if (rgba_data && rgba_len > 0) {
+        // waywall's atlas.raw format is:
+        // - 8-byte header: uint32_le width, uint32_le height
+        // - followed by width*height*4 bytes of RGBA data
+        bytes = (const unsigned char *)rgba_data;
+        pixel_len = rgba_len;
+        if (rgba_len >= 8) {
+            uint32_t header_w = (uint32_t)bytes[0] | ((uint32_t)bytes[1] << 8) | ((uint32_t)bytes[2] << 16) |
+                                ((uint32_t)bytes[3] << 24);
+            uint32_t header_h = (uint32_t)bytes[4] | ((uint32_t)bytes[5] << 8) | ((uint32_t)bytes[6] << 16) |
+                                ((uint32_t)bytes[7] << 24);
+
+            size_t header_pixels = (size_t)header_w * (size_t)header_h * 4;
+            if (header_w > 0 && header_h > 0 && rgba_len == header_pixels + 8) {
+                // Prefer the header dimensions.
+                if (width != header_w) {
+                    vk_log(LOG_WARN, "atlas width param (%u) != header width (%u), using header", width, header_w);
+                }
+                width = header_w;
+                pixel_len = header_pixels;
+                bytes += 8;
+            }
+        }
+
+        if (pixel_len % ((size_t)width * 4) != 0) {
+            vk_log(LOG_ERROR, "atlas raw size mismatch: width=%u len=%zu", width, pixel_len);
+            return NULL;
+        }
+
+        height = (uint32_t)(pixel_len / ((size_t)width * 4));
+    } else {
+        // No initial data - create empty atlas (square, using width as both dimensions)
+        height = width;
+        pixel_len = (size_t)width * height * 4;
+        bytes = zalloc(1, pixel_len);  // Allocate zeroed (black/transparent) pixel data
+        if (!bytes) {
+            return NULL;
+        }
+        need_free = true;
+        vk_log(LOG_INFO, "creating empty atlas: %ux%u", width, height);
+    }
+
+    struct vk_atlas *atlas = zalloc(1, sizeof(*atlas));
+    atlas->vk = vk;
+    atlas->width = width;
+    atlas->height = height;
+    atlas->refcount = 1;
+    wl_list_init(&atlas->link);
+    wl_list_insert(&vk->atlases, &atlas->link);
+
+    struct vk_image_options opts = { .dst = {0} };
+    struct vk_image *tmp = server_vk_add_rgba_image(vk, "atlas.raw", width, height, bytes, &opts);
+    
+    // Free temp buffer if we allocated it for empty atlas
+    if (need_free) {
+        free((void*)bytes);
+        bytes = NULL;
+    }
+    
+    if (!tmp) {
+        free(atlas);
+        return NULL;
+    }
+
+    // Steal GPU resources from temp image; this atlas isn't part of vk->images list.
+    atlas->image = tmp->image;
+    atlas->memory = tmp->memory;
+    atlas->view = tmp->view;
+    atlas->descriptor_set = tmp->descriptor_set;
+
+    // Prevent temp image cleanup from freeing atlas resources.
+    tmp->owns_descriptor_set = false;
+    tmp->owns_image = false;
+    tmp->image = VK_NULL_HANDLE;
+    tmp->memory = VK_NULL_HANDLE;
+    tmp->view = VK_NULL_HANDLE;
+    tmp->descriptor_set = VK_NULL_HANDLE;
+    server_vk_remove_image(vk, tmp);
+
+    vk_log(LOG_INFO, "created atlas: %ux%u", width, height);
+    return atlas;
+}
+
+void
+server_vk_atlas_ref(struct vk_atlas *atlas) {
+    if (atlas) {
+        atlas->refcount++;
+    }
+}
+
+void
+server_vk_atlas_unref(struct vk_atlas *atlas) {
+    if (!atlas) return;
+    if (atlas->refcount == 0) return;
+
+    atlas->refcount--;
+    if (atlas->refcount != 0) return;
+
+    struct server_vk *vk = atlas->vk;
+    if (vk && vk->device) {
+        vkDeviceWaitIdle(vk->device);
+    }
+
+    wl_list_remove(&atlas->link);
+    wl_list_init(&atlas->link);
+
+    if (vk && atlas->descriptor_set != VK_NULL_HANDLE) {
+        vkFreeDescriptorSets(vk->device, vk->descriptor_pool, 1, &atlas->descriptor_set);
+    }
+    if (vk && atlas->view) {
+        vkDestroyImageView(vk->device, atlas->view, NULL);
+    }
+    if (vk && atlas->memory) {
+        vkFreeMemory(vk->device, atlas->memory, NULL);
+    }
+    if (vk && atlas->image) {
+        vkDestroyImage(vk->device, atlas->image, NULL);
+    }
+
+    free(atlas);
+}
+
+bool
+server_vk_atlas_insert_raw(struct vk_atlas *atlas, const char *data, size_t data_len, uint32_t x, uint32_t y) {
+    if (!atlas || !atlas->vk || !atlas->vk->device || !data || data_len == 0) {
+        return false;
+    }
+
+    struct server_vk *vk = atlas->vk;
+
+    struct util_png png = util_png_decode_raw(data, data_len, atlas->width);
+    if (!png.data || png.width <= 0 || png.height <= 0) {
+        return false;
+    }
+
+    uint32_t blit_width = (uint32_t)png.width;
+    uint32_t blit_height = (uint32_t)png.height;
+
+    if (x + blit_width > atlas->width) blit_width = atlas->width - x;
+    if (y + blit_height > atlas->height) blit_height = atlas->height - y;
+    if (blit_width == 0 || blit_height == 0) {
+        free(png.data);
+        return false;
+    }
+
+    vkDeviceWaitIdle(vk->device);
+
+    VkMemoryRequirements mem_reqs;
+    vkGetImageMemoryRequirements(vk->device, atlas->image, &mem_reqs);
+
+    void *mapped = NULL;
+    if (vkMapMemory(vk->device, atlas->memory, 0, mem_reqs.size, 0, &mapped) != VK_SUCCESS) {
+        free(png.data);
+        return false;
+    }
+
+    VkImageSubresource subres = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT};
+    VkSubresourceLayout layout;
+    vkGetImageSubresourceLayout(vk->device, atlas->image, &subres, &layout);
+
+    const unsigned char *src = (const unsigned char *)png.data;
+    unsigned char *dst0 = (unsigned char *)mapped + layout.offset;
+    for (uint32_t row = 0; row < blit_height; row++) {
+        unsigned char *dst = dst0 + ((y + row) * (uint32_t)layout.rowPitch) + x * 4;
+        memcpy(dst, src + (size_t)row * (size_t)png.width * 4, (size_t)blit_width * 4);
+    }
+
+    vkUnmapMemory(vk->device, atlas->memory);
+    free(png.data);
+
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    VkCommandBufferAllocateInfo cmd_alloc = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = vk->command_pool,
+        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+        .commandBufferCount = 1,
+    };
+    if (vkAllocateCommandBuffers(vk->device, &cmd_alloc, &cmd) != VK_SUCCESS) {
+        return false;
+    }
+
+    VkCommandBufferBeginInfo begin_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
+    vkBeginCommandBuffer(cmd, &begin_info);
+
+    VkImageMemoryBarrier barrier = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = atlas->image,
+        .subresourceRange = {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .baseMipLevel = 0,
+            .levelCount = 1,
+            .baseArrayLayer = 0,
+            .layerCount = 1,
+        },
+        .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+    };
+
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0,
+                         NULL, 1, &barrier);
+
+    vkEndCommandBuffer(cmd);
+
+    VkSubmitInfo submit = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &cmd,
+    };
+    vkQueueSubmit(vk->graphics_queue, 1, &submit, VK_NULL_HANDLE);
+    vkQueueWaitIdle(vk->graphics_queue);
+    vkFreeCommandBuffers(vk->device, vk->command_pool, 1, &cmd);
+
+    return true;
+}
+
+char *
+server_vk_atlas_get_dump(struct vk_atlas *atlas, size_t *out_len) {
+    if (!atlas || !atlas->vk || !atlas->vk->device || !out_len) {
+        return NULL;
+    }
+
+    struct server_vk *vk = atlas->vk;
+
+    size_t pixel_data_size = (size_t)atlas->width * (size_t)atlas->height * 4;
+    *out_len = 8 + pixel_data_size;
+
+    char *dump_data = malloc(*out_len);
+    check_alloc(dump_data);
+
+    // Write little-endian header (width, height)
+    dump_data[0] = (char)(atlas->width & 0xFF);
+    dump_data[1] = (char)((atlas->width >> 8) & 0xFF);
+    dump_data[2] = (char)((atlas->width >> 16) & 0xFF);
+    dump_data[3] = (char)((atlas->width >> 24) & 0xFF);
+    dump_data[4] = (char)(atlas->height & 0xFF);
+    dump_data[5] = (char)((atlas->height >> 8) & 0xFF);
+    dump_data[6] = (char)((atlas->height >> 16) & 0xFF);
+    dump_data[7] = (char)((atlas->height >> 24) & 0xFF);
+
+    vkDeviceWaitIdle(vk->device);
+
+    VkMemoryRequirements mem_reqs;
+    vkGetImageMemoryRequirements(vk->device, atlas->image, &mem_reqs);
+
+    void *mapped = NULL;
+    if (vkMapMemory(vk->device, atlas->memory, 0, mem_reqs.size, 0, &mapped) != VK_SUCCESS) {
+        free(dump_data);
+        *out_len = 0;
+        return NULL;
+    }
+
+    VkImageSubresource subres = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT};
+    VkSubresourceLayout layout;
+    vkGetImageSubresourceLayout(vk->device, atlas->image, &subres, &layout);
+
+    unsigned char *out_pixels = (unsigned char *)dump_data + 8;
+    const unsigned char *src0 = (const unsigned char *)mapped + layout.offset;
+    size_t row_bytes = (size_t)atlas->width * 4;
+
+    for (uint32_t row = 0; row < atlas->height; row++) {
+        memcpy(out_pixels + (size_t)row * row_bytes, src0 + (size_t)row * layout.rowPitch, row_bytes);
+    }
+
+    vkUnmapMemory(vk->device, atlas->memory);
+    return dump_data;
+}
+
+struct vk_image *
+server_vk_add_image_from_atlas(struct server_vk *vk, struct vk_atlas *atlas, struct box src,
+                               const struct vk_image_options *options) {
+    if (!vk || !atlas || !options) return NULL;
+
+    struct vk_image *image = zalloc(1, sizeof(*image));
+    image->atlas = atlas;
+    server_vk_atlas_ref(atlas);
+
+    image->dst = options->dst;
+    image->depth = options->depth;
+    image->enabled = true;
+    image->owns_descriptor_set = false;
+    image->owns_image = false;
+    image->descriptor_set = atlas->descriptor_set;
+    image->width = src.width;
+    image->height = src.height;
+
+    float u0 = (float)src.x / (float)atlas->width;
+    float v0 = (float)src.y / (float)atlas->height;
+    float u1 = (float)(src.x + src.width) / (float)atlas->width;
+    float v1 = (float)(src.y + src.height) / (float)atlas->height;
+
+    struct quad_vertex verts[6] = {
+        {{ -1.0f, -1.0f }, { u0, v0 }},
+        {{ -1.0f,  1.0f }, { u0, v1 }},
+        {{  1.0f,  1.0f }, { u1, v1 }},
+        {{ -1.0f, -1.0f }, { u0, v0 }},
+        {{  1.0f,  1.0f }, { u1, v1 }},
+        {{  1.0f, -1.0f }, { u1, v0 }},
+    };
+
+    VkDeviceSize buffer_size = sizeof(verts);
+    VkBufferCreateInfo buffer_info = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = buffer_size,
+        .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+    };
+    if (vkCreateBuffer(vk->device, &buffer_info, NULL, &image->vertex_buffer) != VK_SUCCESS) {
+        server_vk_remove_image(vk, image);
+        return NULL;
+    }
+
+    VkMemoryRequirements mem_reqs;
+    vkGetBufferMemoryRequirements(vk->device, image->vertex_buffer, &mem_reqs);
+    uint32_t mem_type = find_memory_type(vk, mem_reqs.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (mem_type == UINT32_MAX) {
+        server_vk_remove_image(vk, image);
+        return NULL;
+    }
+
+    VkMemoryAllocateInfo alloc_info = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = mem_reqs.size,
+        .memoryTypeIndex = mem_type,
+    };
+    if (vkAllocateMemory(vk->device, &alloc_info, NULL, &image->vertex_memory) != VK_SUCCESS) {
+        server_vk_remove_image(vk, image);
+        return NULL;
+    }
+
+    vkBindBufferMemory(vk->device, image->vertex_buffer, image->vertex_memory, 0);
+
+    void *mapped;
+    if (vkMapMemory(vk->device, image->vertex_memory, 0, buffer_size, 0, &mapped) == VK_SUCCESS) {
+        memcpy(mapped, verts, sizeof(verts));
+        vkUnmapMemory(vk->device, image->vertex_memory);
+    }
+
+    wl_list_insert(&vk->images, &image->link);
+    return image;
+}
+
 struct vk_image *
 server_vk_add_image(struct server_vk *vk, const char *path, const struct vk_image_options *options) {
     // Load PNG file
@@ -3280,6 +5837,8 @@ server_vk_add_image(struct server_vk *vk, const char *path, const struct vk_imag
     image->height = png.height;
     image->dst = options->dst;
     image->enabled = true;
+    image->owns_descriptor_set = true;
+    image->owns_image = true;
 
     // Create Vulkan image
     VkImageCreateInfo image_ci = {
@@ -3483,6 +6042,43 @@ server_vk_add_image(struct server_vk *vk, const char *path, const struct vk_imag
     return image;
 }
 
+struct vk_image *
+server_vk_add_avif_image(struct server_vk *vk, const char *path, const struct vk_image_options *options) {
+    struct util_avif avif = util_avif_decode(path, 4096);
+    if (!avif.frames || avif.frame_count == 0 || avif.width == 0 || avif.height == 0) {
+        util_avif_free(&avif);
+        vk_log(LOG_ERROR, "failed to load AVIF: %s", path);
+        return NULL;
+    }
+
+    struct util_avif_frame *frame0 = &avif.frames[0];
+    struct vk_image *image = server_vk_add_rgba_image(vk, path, (uint32_t)avif.width, (uint32_t)avif.height,
+                                                      (const unsigned char *)frame0->data, options);
+    if (!image) {
+        util_avif_free(&avif);
+        return NULL;
+    }
+
+    if (avif.is_animated && avif.frame_count > 1) {
+        // Transfer ownership of decoded frames to the image for per-frame updates.
+        image->frames = avif.frames;
+        image->frame_count = avif.frame_count;
+        image->frame_index = 0;
+
+        double dur_s = frame0->duration;
+        if (!(dur_s > 0.0)) dur_s = 0.1;
+        uint64_t dur_ms = (uint64_t)llround(dur_s * 1000.0);
+        if (dur_ms == 0) dur_ms = 1;
+        image->next_frame_ms = now_ms() + dur_ms;
+
+        avif.frames = NULL;
+        avif.frame_count = 0;
+    }
+
+    util_avif_free(&avif);
+    return image;
+}
+
 void
 server_vk_remove_image(struct server_vk *vk, struct vk_image *image) {
     if (!image) return;
@@ -3492,20 +6088,43 @@ server_vk_remove_image(struct server_vk *vk, struct vk_image *image) {
     // Wait for GPU to finish using this image
     vkDeviceWaitIdle(vk->device);
 
+    if (image->frames) {
+        for (size_t i = 0; i < image->frame_count; i++) {
+            free(image->frames[i].data);
+        }
+        free(image->frames);
+        image->frames = NULL;
+        image->frame_count = 0;
+        image->frame_index = 0;
+        image->next_frame_ms = 0;
+    }
+
     // Free descriptor set back to pool
-    if (image->descriptor_set != VK_NULL_HANDLE) {
+    if (image->owns_descriptor_set && image->descriptor_set != VK_NULL_HANDLE) {
         vkFreeDescriptorSets(vk->device, vk->descriptor_pool, 1, &image->descriptor_set);
     }
 
-    // Destroy Vulkan resources
-    if (image->view) {
-        vkDestroyImageView(vk->device, image->view, NULL);
+    if (image->vertex_buffer) {
+        vkFreeMemory(vk->device, image->vertex_memory, NULL);
+        vkDestroyBuffer(vk->device, image->vertex_buffer, NULL);
     }
-    if (image->memory) {
-        vkFreeMemory(vk->device, image->memory, NULL);
+
+    // Destroy Vulkan resources (if owned by this image)
+    if (image->owns_image) {
+        if (image->view) {
+            vkDestroyImageView(vk->device, image->view, NULL);
+        }
+        if (image->memory) {
+            vkFreeMemory(vk->device, image->memory, NULL);
+        }
+        if (image->image) {
+            vkDestroyImage(vk->device, image->image, NULL);
+        }
     }
-    if (image->image) {
-        vkDestroyImage(vk->device, image->image, NULL);
+
+    if (image->atlas) {
+        server_vk_atlas_unref(image->atlas);
+        image->atlas = NULL;
     }
 
     wl_list_remove(&image->link);
@@ -3524,29 +6143,86 @@ server_vk_image_set_enabled(struct vk_image *image, bool enabled) {
 // ============================================================================
 
 #define VK_FONT_ATLAS_SIZE 1024
+#define VK_MAX_TEXT_BYTES 16384
+#define VK_MAX_ADVANCE_BYTES 16384
+
+// Safe bounded strdup for text payloads
+static char *
+vk_strdup_bounded(const char *src) {
+    if (!src) {
+        return strdup("");
+    }
+    size_t len = strlen(src);
+    if (len > VK_MAX_TEXT_BYTES) {
+        len = VK_MAX_TEXT_BYTES;
+    }
+    char *dst = malloc(len + 1);
+    if (!dst) {
+        return NULL;
+    }
+    memcpy(dst, src, len);
+    dst[len] = '\0';
+    return dst;
+}
 
 // Text vertex structure (matches text.frag expectations)
 struct text_vertex {
-    float src_pos[2];   // UV coords in font atlas
+    // Matches the shared texcopy vertex shader inputs:
+    // layout(location=0) v_src_pos (pixels)
+    // layout(location=1) v_dst_pos (pixels)
+    // layout(location=2) v_src_rgba (unused)
+    // layout(location=3) v_dst_rgba (text color)
+    float src_pos[2];   // Pixel coords in font atlas
+    float dst_pos[2];   // Pixel coords on output surface
     float src_rgba[4];  // Unused
     float dst_rgba[4];  // Text color with alpha
 };
 
 // UTF-8 decode helper
 static uint32_t
-vk_utf8_decode(const char **str) {
+vk_utf8_decode_bounded(const char **str, const char *end) {
+    if (!str || !*str || *str >= end) {
+        return 0;
+    }
+
     const unsigned char *s = (const unsigned char *)*str;
-    uint32_t cp;
-    int len;
+    const size_t remaining = (size_t)(end - *str);
 
-    if (s[0] < 0x80) { cp = s[0]; len = 1; }
-    else if ((s[0] & 0xE0) == 0xC0) { cp = ((s[0] & 0x1F) << 6) | (s[1] & 0x3F); len = 2; }
-    else if ((s[0] & 0xF0) == 0xE0) { cp = ((s[0] & 0x0F) << 12) | ((s[1] & 0x3F) << 6) | (s[2] & 0x3F); len = 3; }
-    else if ((s[0] & 0xF8) == 0xF0) { cp = ((s[0] & 0x07) << 18) | ((s[1] & 0x3F) << 12) |
-                                        ((s[2] & 0x3F) << 6) | (s[3] & 0x3F); len = 4; }
-    else { cp = 0xFFFD; len = 1; }
+    uint32_t cp = 0xFFFD;
+    size_t len = 1;
 
-    *str += len;
+    unsigned char b0 = s[0];
+    if (b0 < 0x80) {
+        cp = b0;
+        len = 1;
+    } else if ((b0 & 0xE0) == 0xC0) {
+        if (remaining < 2) goto done;
+        unsigned char b1 = s[1];
+        if ((b1 & 0xC0) != 0x80) goto done;
+        cp = ((uint32_t)(b0 & 0x1F) << 6) | (uint32_t)(b1 & 0x3F);
+        if (cp < 0x80) cp = 0xFFFD; // overlong
+        len = 2;
+    } else if ((b0 & 0xF0) == 0xE0) {
+        if (remaining < 3) goto done;
+        unsigned char b1 = s[1], b2 = s[2];
+        if ((b1 & 0xC0) != 0x80 || (b2 & 0xC0) != 0x80) goto done;
+        cp = ((uint32_t)(b0 & 0x0F) << 12) | ((uint32_t)(b1 & 0x3F) << 6) | (uint32_t)(b2 & 0x3F);
+        if (cp < 0x800) cp = 0xFFFD; // overlong
+        if (cp >= 0xD800 && cp <= 0xDFFF) cp = 0xFFFD; // surrogate
+        len = 3;
+    } else if ((b0 & 0xF8) == 0xF0) {
+        if (remaining < 4) goto done;
+        unsigned char b1 = s[1], b2 = s[2], b3 = s[3];
+        if ((b1 & 0xC0) != 0x80 || (b2 & 0xC0) != 0x80 || (b3 & 0xC0) != 0x80) goto done;
+        cp = ((uint32_t)(b0 & 0x07) << 18) | ((uint32_t)(b1 & 0x3F) << 12) |
+             ((uint32_t)(b2 & 0x3F) << 6) | (uint32_t)(b3 & 0x3F);
+        if (cp < 0x10000) cp = 0xFFFD; // overlong
+        if (cp > 0x10FFFF) cp = 0xFFFD;
+        len = 4;
+    }
+
+done:
+    *str += (ptrdiff_t)len;
     return cp;
 }
 
@@ -3831,11 +6507,20 @@ create_text_vk_pipeline(struct server_vk *vk) {
         return false;
     }
 
+    // Push constant range (shared texcopy vertex shader expects this)
+    VkPushConstantRange push_constant = {
+        .stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
+        .offset = 0,
+        .size = sizeof(struct vk_push_constants),
+    };
+
     // Pipeline layout
     VkPipelineLayoutCreateInfo layout_info = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
         .setLayoutCount = 1,
         .pSetLayouts = &vk->text_vk_pipeline.descriptor_layout,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &push_constant,
     };
 
     if (vkCreatePipelineLayout(vk->device, &layout_info, NULL, &vk->text_vk_pipeline.layout) != VK_SUCCESS) {
@@ -3866,7 +6551,7 @@ create_text_vk_pipeline(struct server_vk *vk) {
         },
     };
 
-    // Vertex input for text (matches text.frag inputs)
+    // Vertex input - matches shared texcopy vertex shader inputs
     VkVertexInputBindingDescription binding = {
         .binding = 0,
         .stride = sizeof(struct text_vertex),
@@ -3874,9 +6559,10 @@ create_text_vk_pipeline(struct server_vk *vk) {
     };
 
     VkVertexInputAttributeDescription attributes[] = {
-        { .location = 0, .binding = 0, .format = VK_FORMAT_R32G32_SFLOAT, .offset = 0 },  // src_pos (UV)
-        { .location = 1, .binding = 0, .format = VK_FORMAT_R32G32B32A32_SFLOAT, .offset = sizeof(float) * 2 },  // src_rgba
-        { .location = 2, .binding = 0, .format = VK_FORMAT_R32G32B32A32_SFLOAT, .offset = sizeof(float) * 6 },  // dst_rgba
+        { .location = 0, .binding = 0, .format = VK_FORMAT_R32G32_SFLOAT, .offset = offsetof(struct text_vertex, src_pos) },
+        { .location = 1, .binding = 0, .format = VK_FORMAT_R32G32_SFLOAT, .offset = offsetof(struct text_vertex, dst_pos) },
+        { .location = 2, .binding = 0, .format = VK_FORMAT_R32G32B32A32_SFLOAT, .offset = offsetof(struct text_vertex, src_rgba) },
+        { .location = 3, .binding = 0, .format = VK_FORMAT_R32G32B32A32_SFLOAT, .offset = offsetof(struct text_vertex, dst_rgba) },
     };
 
     VkPipelineVertexInputStateCreateInfo vertex_input = {
@@ -3918,16 +6604,17 @@ create_text_vk_pipeline(struct server_vk *vk) {
         .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
     };
 
-    // Alpha blending for text
+    // Pre-multiplied alpha blending for text
+    // Shader outputs pre-multiplied colors (rgb * a, a)
     VkPipelineColorBlendAttachmentState blend_attachment = {
         .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
                           VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
         .blendEnable = VK_TRUE,
-        .srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA,
+        .srcColorBlendFactor = VK_BLEND_FACTOR_ONE,  // Pre-multiplied alpha
         .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
         .colorBlendOp = VK_BLEND_OP_ADD,
         .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
-        .dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO,
+        .dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
         .alphaBlendOp = VK_BLEND_OP_ADD,
     };
 
@@ -3966,47 +6653,8 @@ create_text_vk_pipeline(struct server_vk *vk) {
 }
 
 // Draw all text objects
-static void
-draw_texts(struct server_vk *vk, VkCommandBuffer cmd) {
-    if (wl_list_empty(&vk->texts)) {
-        return;
-    }
-
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk->text_vk_pipeline.pipeline);
-
-    struct vk_text *text;
-    wl_list_for_each(text, &vk->texts, link) {
-        if (!text->enabled || !text->font || text->vertex_count == 0) {
-            continue;
-        }
-
-        // Bind font atlas descriptor
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                vk->text_vk_pipeline.layout, 0, 1,
-                                &text->font->atlas_descriptor, 0, NULL);
-
-        // Bind vertex buffer
-        VkDeviceSize offset = 0;
-        vkCmdBindVertexBuffers(cmd, 0, 1, &text->vertex_buffer, &offset);
-
-        // Set viewport to cover entire screen
-        VkViewport viewport = {
-            .x = 0, .y = 0,
-            .width = (float)vk->swapchain.extent.width,
-            .height = (float)vk->swapchain.extent.height,
-            .minDepth = 0.0f, .maxDepth = 1.0f,
-        };
-        vkCmdSetViewport(cmd, 0, 1, &viewport);
-
-        VkRect2D scissor = {
-            .offset = { 0, 0 },
-            .extent = vk->swapchain.extent,
-        };
-        vkCmdSetScissor(cmd, 0, 1, &scissor);
-
-        vkCmdDraw(cmd, text->vertex_count, 1, 0, 0);
-    }
-}
+// Note: This logic has been moved to draw_text_single and draw_sorted_objects.
+// Keeping this comment as a placeholder where the old function was.
 
 // Build text vertex buffer
 static bool
@@ -4015,90 +6663,156 @@ build_text_vertices(struct server_vk *vk, struct vk_text *text) {
         text->vertex_count = 0;
         return true;
     }
+    static const float UNUSED_RGBA[4] = { 0.f, 0.f, 0.f, 0.f };
 
-    // Count characters
-    size_t char_count = 0;
-    const char *p = text->text;
-    while (*p) {
-        vk_utf8_decode(&p);
-        char_count++;
+    const size_t total_len = strlen(text->text);
+    const size_t used_len = total_len > VK_MAX_TEXT_BYTES ? VK_MAX_TEXT_BYTES : total_len;
+    if (total_len > VK_MAX_TEXT_BYTES) {
+        vk_log(LOG_WARN, "text truncated for rendering (%zu bytes > %u)", total_len, VK_MAX_TEXT_BYTES);
     }
 
-    // Allocate vertices (6 per character for 2 triangles)
-    size_t vertex_count = char_count * 6;
-    struct text_vertex *vertices = zalloc(vertex_count, sizeof(*vertices));
+    // Worst-case: every byte is a glyph -> 6 vertices per byte.
+    size_t max_vertices = used_len * 6;
+    struct text_vertex *vertices = zalloc(max_vertices ? max_vertices : 6, sizeof(*vertices));
 
-    float color[4] = {
-        ((text->color >> 24) & 0xFF) / 255.0f,
-        ((text->color >> 16) & 0xFF) / 255.0f,
-        ((text->color >> 8) & 0xFF) / 255.0f,
-        (text->color & 0xFF) / 255.0f,
+    // Parse inline tags compatible with the OpenGL text renderer:
+    // - "<#RRGGBBAA>" changes the current color
+    // - "<+N>" advances by N pixels (used to reserve emote space)
+    uint32_t current_color_u32 = text->color;
+    float current_color[4] = {
+        ((current_color_u32 >> 24) & 0xFF) / 255.0f,
+        ((current_color_u32 >> 16) & 0xFF) / 255.0f,
+        ((current_color_u32 >> 8) & 0xFF) / 255.0f,
+        (current_color_u32 & 0xFF) / 255.0f,
     };
 
     int32_t x = text->x;
-    int32_t y = text->y;
+    int32_t y = text->y; // baseline y in pixels (top-left origin, y down)
     size_t vtx_idx = 0;
-    float atlas_w = (float)text->font->atlas_width;
-    float atlas_h = (float)text->font->atlas_height;
-    float screen_w = (float)vk->swapchain.extent.width;
-    float screen_h = (float)vk->swapchain.extent.height;
 
-    p = text->text;
-    while (*p) {
-        uint32_t cp = vk_utf8_decode(&p);
+    const char *p = text->text;
+    const char *end = text->text + used_len;
+    while (p < end && *p) {
+        // Color tag: <#RRGGBBAA> or <#RRGGBB>
+        if (p[0] == '<' && p[1] == '#') {
+            uint32_t rgba = 0;
+            int hex_len = 0;
+            const char *q = p + 2;
+            while (hex_len < 8) {
+                char c = q[hex_len];
+                if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) {
+                    break;
+                }
+                hex_len++;
+            }
+            if ((hex_len == 6 || hex_len == 8) && q[hex_len] == '>') {
+                for (int i = 0; i < hex_len; i++) {
+                    char c = q[i];
+                    uint32_t val = 0;
+                    if (c >= '0' && c <= '9') val = (uint32_t)(c - '0');
+                    else if (c >= 'a' && c <= 'f') val = (uint32_t)(10 + c - 'a');
+                    else if (c >= 'A' && c <= 'F') val = (uint32_t)(10 + c - 'A');
+                    rgba = (rgba << 4) | val;
+                }
+                if (hex_len == 6) {
+                    rgba = (rgba << 8) | 0xFF;
+                }
+                current_color_u32 = rgba;
+                current_color[0] = ((current_color_u32 >> 24) & 0xFF) / 255.0f;
+                current_color[1] = ((current_color_u32 >> 16) & 0xFF) / 255.0f;
+                current_color[2] = ((current_color_u32 >> 8) & 0xFF) / 255.0f;
+                current_color[3] = (current_color_u32 & 0xFF) / 255.0f;
+                p = q + hex_len + 1;
+                continue;
+            }
+        }
 
+        // Advance tag: <+N>
+        if (p[0] == '<' && p[1] == '+') {
+            char *q = NULL;
+            double adv = strtod(p + 2, &q);
+            if (q && q < end && *q == '>') {
+                x += (int32_t)llround(adv);
+                p = q + 1;
+                continue;
+            }
+            // Don't render raw "<+...>" if it's malformed; just skip it.
+            const char *skip = p + 2;
+            while (skip < end && *skip && *skip != '>') skip++;
+            if (skip < end && *skip == '>') {
+                p = skip + 1;
+                continue;
+            }
+        }
+
+        uint32_t cp = vk_utf8_decode_bounded(&p, end);
         if (cp == '\n') {
-            y += text->size * vk->font.base_font_size / text->size + 4;
             x = text->x;
+            y += (int32_t)text->size + text->line_spacing;
             continue;
         }
 
         struct vk_glyph *g = get_glyph(vk, text->font, cp);
-        if (!g) continue;
+        if (!g) {
+            continue;
+        }
 
-        // Calculate screen position (normalized device coords from pixel coords)
         float px = (float)(x + g->bearing_x);
-        float py = (float)(y - g->bearing_y + (int)text->font->size);
+        float py = (float)(y - g->bearing_y);
         float pw = (float)g->width;
         float ph = (float)g->height;
 
-        // UV coords in atlas (normalized)
-        float u0 = g->atlas_x / atlas_w;
-        float v0 = g->atlas_y / atlas_h;
-        float u1 = (g->atlas_x + g->width) / atlas_w;
-        float v1 = (g->atlas_y + g->height) / atlas_h;
+        float u0 = (float)g->atlas_x;
+        float v0 = (float)g->atlas_y;
+        float u1 = (float)(g->atlas_x + g->width);
+        float v1 = (float)(g->atlas_y + g->height);
 
-        // Screen coords (normalized to 0-1)
-        float x0 = px / screen_w * 2.0f - 1.0f;
-        float y0 = py / screen_h * 2.0f - 1.0f;
-        float x1 = (px + pw) / screen_w * 2.0f - 1.0f;
-        float y1 = (py + ph) / screen_h * 2.0f - 1.0f;
+        float x0 = px;
+        float y0 = py;
+        float x1 = px + pw;
+        float y1 = py + ph;
 
-        // Generate 6 vertices for 2 triangles
+        if (vtx_idx + 6 > max_vertices) {
+            // Shouldn't happen due to conservative allocation, but guard anyway.
+            break;
+        }
+
         // Triangle 1
         vertices[vtx_idx].src_pos[0] = u0; vertices[vtx_idx].src_pos[1] = v0;
-        memcpy(vertices[vtx_idx].dst_rgba, color, sizeof(color));
+        vertices[vtx_idx].dst_pos[0] = x0; vertices[vtx_idx].dst_pos[1] = y0;
+        memcpy(vertices[vtx_idx].src_rgba, UNUSED_RGBA, sizeof(UNUSED_RGBA));
+        memcpy(vertices[vtx_idx].dst_rgba, current_color, sizeof(current_color));
         vtx_idx++;
 
         vertices[vtx_idx].src_pos[0] = u1; vertices[vtx_idx].src_pos[1] = v0;
-        memcpy(vertices[vtx_idx].dst_rgba, color, sizeof(color));
+        vertices[vtx_idx].dst_pos[0] = x1; vertices[vtx_idx].dst_pos[1] = y0;
+        memcpy(vertices[vtx_idx].src_rgba, UNUSED_RGBA, sizeof(UNUSED_RGBA));
+        memcpy(vertices[vtx_idx].dst_rgba, current_color, sizeof(current_color));
         vtx_idx++;
 
         vertices[vtx_idx].src_pos[0] = u1; vertices[vtx_idx].src_pos[1] = v1;
-        memcpy(vertices[vtx_idx].dst_rgba, color, sizeof(color));
+        vertices[vtx_idx].dst_pos[0] = x1; vertices[vtx_idx].dst_pos[1] = y1;
+        memcpy(vertices[vtx_idx].src_rgba, UNUSED_RGBA, sizeof(UNUSED_RGBA));
+        memcpy(vertices[vtx_idx].dst_rgba, current_color, sizeof(current_color));
         vtx_idx++;
 
         // Triangle 2
         vertices[vtx_idx].src_pos[0] = u0; vertices[vtx_idx].src_pos[1] = v0;
-        memcpy(vertices[vtx_idx].dst_rgba, color, sizeof(color));
+        vertices[vtx_idx].dst_pos[0] = x0; vertices[vtx_idx].dst_pos[1] = y0;
+        memcpy(vertices[vtx_idx].src_rgba, UNUSED_RGBA, sizeof(UNUSED_RGBA));
+        memcpy(vertices[vtx_idx].dst_rgba, current_color, sizeof(current_color));
         vtx_idx++;
 
         vertices[vtx_idx].src_pos[0] = u1; vertices[vtx_idx].src_pos[1] = v1;
-        memcpy(vertices[vtx_idx].dst_rgba, color, sizeof(color));
+        vertices[vtx_idx].dst_pos[0] = x1; vertices[vtx_idx].dst_pos[1] = y1;
+        memcpy(vertices[vtx_idx].src_rgba, UNUSED_RGBA, sizeof(UNUSED_RGBA));
+        memcpy(vertices[vtx_idx].dst_rgba, current_color, sizeof(current_color));
         vtx_idx++;
 
         vertices[vtx_idx].src_pos[0] = u0; vertices[vtx_idx].src_pos[1] = v1;
-        memcpy(vertices[vtx_idx].dst_rgba, color, sizeof(color));
+        vertices[vtx_idx].dst_pos[0] = x0; vertices[vtx_idx].dst_pos[1] = y1;
+        memcpy(vertices[vtx_idx].src_rgba, UNUSED_RGBA, sizeof(UNUSED_RGBA));
+        memcpy(vertices[vtx_idx].dst_rgba, current_color, sizeof(current_color));
         vtx_idx++;
 
         x += g->advance;
@@ -4174,16 +6888,22 @@ server_vk_add_text(struct server_vk *vk, const char *str, const struct vk_text_o
 
     struct vk_text *text = zalloc(1, sizeof(*text));
     text->vk = vk;
-    text->text = strdup(str ? str : "");
+    text->text = vk_strdup_bounded(str ? str : "");
+    if (!text->text) {
+        free(text);
+        return NULL;
+    }
     text->x = options->x;
     text->y = options->y;
     text->size = options->size > 0 ? options->size : 1;
+    text->line_spacing = options->line_spacing;
     text->color = options->color;
+    text->depth = options->depth;
     text->enabled = true;
     text->dirty = true;
 
-    // Get font size cache (size multiplied by base font size)
-    uint32_t font_size = text->size * vk->font.base_font_size;
+    // Get font size cache (size is pixel size)
+    uint32_t font_size = text->size;
     text->font = get_font_size(vk, font_size);
     if (!text->font) {
         free(text->text);
@@ -4236,7 +6956,10 @@ server_vk_text_set_text(struct vk_text *text, const char *new_text) {
     if (!text) return;
 
     free(text->text);
-    text->text = strdup(new_text ? new_text : "");
+    text->text = vk_strdup_bounded(new_text ? new_text : "");
+    if (!text->text) {
+        text->text = strdup("");
+    }
     text->dirty = true;
 
     // Rebuild vertices immediately
@@ -4252,4 +6975,148 @@ server_vk_text_set_color(struct vk_text *text, uint32_t color) {
 
     // Rebuild vertices immediately
     build_text_vertices(text->vk, text);
+}
+
+struct vk_advance_ret
+server_vk_text_advance(struct server_vk *vk, const char *data, size_t data_len, uint32_t size) {
+    if (!vk || !vk->font.ft_face || !data || data_len == 0 || size == 0) {
+        return (struct vk_advance_ret){ .x = 0, .y = 0 };
+    }
+
+    if (data_len > VK_MAX_ADVANCE_BYTES) {
+        data_len = VK_MAX_ADVANCE_BYTES;
+    }
+
+    struct vk_font_size *fs = get_font_size(vk, size);
+    if (!fs) {
+        return (struct vk_advance_ret){ .x = 0, .y = 0 };
+    }
+
+    int32_t x = 0;
+    int32_t y = 0;
+
+    const char *p = data;
+    const char *end = data + data_len;
+    while (p < end && *p) {
+        // Skip color tags: <#RRGGBBAA> / <#RRGGBB>
+        if (p + 3 < end && p[0] == '<' && p[1] == '#') {
+            int hex_len = 0;
+            const char *q = p + 2;
+            while ((q + hex_len) < end && hex_len < 8) {
+                char c = q[hex_len];
+                if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) {
+                    break;
+                }
+                hex_len++;
+            }
+            if ((hex_len == 6 || hex_len == 8) && (q + hex_len) < end && q[hex_len] == '>') {
+                p = q + hex_len + 1;
+                continue;
+            }
+        }
+
+        // Handle advance-only tags: <+N>
+        if (p + 3 < end && p[0] == '<' && p[1] == '+') {
+            const char *q = p + 2;
+            char buf[64];
+            size_t n = 0;
+            while (q < end && *q != '>' && n + 1 < sizeof(buf)) {
+                buf[n++] = *q++;
+            }
+            if (q < end && *q == '>' && n > 0) {
+                buf[n] = '\0';
+                char *endptr = NULL;
+                double adv = strtod(buf, &endptr);
+                if (endptr && endptr != buf && *endptr == '\0') {
+                    x += (int32_t)llround(adv);
+                    p = q + 1;
+                    continue;
+                }
+            }
+        }
+
+        // If this looks like an advance tag but we failed to parse it, skip it as text.
+        // This prevents raw "<+...>" from leaking into chat when Lua emits floats.
+        if (p + 2 < end && p[0] == '<' && p[1] == '+') {
+            const char *q = p + 2;
+            while (q < end && *q && *q != '>') q++;
+            if (q < end && *q == '>') {
+                p = q + 1;
+                continue;
+            }
+        }
+
+        uint32_t cp = vk_utf8_decode_bounded(&p, end);
+        if (cp == '\n') {
+            x = 0;
+            y += (int32_t)size;
+            continue;
+        }
+
+        struct vk_glyph *g = get_glyph(vk, fs, cp);
+        if (!g) continue;
+        x += g->advance;
+    }
+
+    return (struct vk_advance_ret){ .x = x, .y = y };
+}
+
+// ============================================================================
+// Floating View API
+// ============================================================================
+
+struct vk_view *
+server_vk_add_view(struct server_vk *vk, struct server_view *view) {
+    struct vk_view *v = zalloc(1, sizeof(*v));
+    v->vk = vk;
+    v->view = view;
+    v->enabled = true;
+    wl_list_insert(&vk->views, &v->link);
+    return v;
+}
+
+void
+server_vk_remove_view(struct server_vk *vk, struct vk_view *view) {
+    wl_list_remove(&view->link);
+    free(view);
+}
+
+void
+server_vk_view_set_buffer(struct vk_view *view, struct server_buffer *buffer) {
+    if (!buffer) {
+        view->current_buffer = NULL;
+        return;
+    }
+    
+    struct vk_buffer *b = NULL;
+    struct vk_buffer *iter;
+    wl_list_for_each(iter, &view->vk->capture.buffers, link) {
+        if (iter->parent == buffer) {
+            b = iter;
+            break;
+        }
+    }
+    
+    // If buffer not found in capture list, import it
+    if (!b) {
+        b = vk_buffer_import(view->vk, buffer);
+        if (b) {
+            vk_log(LOG_INFO, "imported floating view buffer: %dx%d", b->width, b->height);
+        }
+    }
+    
+    view->current_buffer = b;
+}
+
+void
+server_vk_view_set_geometry(struct vk_view *view, int32_t x, int32_t y, int32_t width, int32_t height) {
+    view->dst.x = x;
+    view->dst.y = y;
+    view->dst.width = width;
+    view->dst.height = height;
+}
+
+void
+server_vk_view_set_enabled(struct vk_view *view, bool enabled) {
+    view->enabled = enabled;
 }

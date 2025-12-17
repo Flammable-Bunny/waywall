@@ -3,10 +3,14 @@
 
 #include "server/server.h"
 #include <stdbool.h>
+#include <stdint.h>
 #include <wayland-client-core.h>
 #include <wayland-server-core.h>
 
 #define DMABUF_MAX_PLANES 4
+#define DMABUF_EXPORT_MAX 3
+
+struct gbm_device;
 
 struct server_linux_dmabuf {
     struct wl_global *global;
@@ -18,6 +22,21 @@ struct server_linux_dmabuf {
     struct wl_event_queue *queue;       // queue for proxy wrappers
 
     struct wl_listener on_display_destroy;
+
+    // When true, the Vulkan backend is in "proxy game" mode and game surfaces are committed
+    // directly to the host compositor via subsurfaces. In this mode, dma-buf feedback must be
+    // passed through unchanged so buffers can actually be imported by the host compositor.
+    bool proxy_game;
+
+    // GBM device used to allocate export dma-bufs on the compositor GPU (Waywall process GPU).
+    int export_drm_fd;
+    struct gbm_device *export_gbm;
+
+    // When true, pass through dmabuf modifiers/format tables from the host compositor.
+    bool allow_modifiers;
+    // When true, override dmabuf feedback devices to point to the Intel render node (renderD129)
+    // so clients allocate on the Intel GPU even if the host compositor is on AMD.
+    bool force_intel_feedback;
 };
 
 struct server_linux_buffer_params {
@@ -56,6 +75,18 @@ struct server_dmabuf_data {
         int32_t fd;
         uint32_t offset, stride;
     } planes[DMABUF_MAX_PLANES];
+
+    // Proxy-game export buffers (allocated on the compositor GPU) used for
+    // "import → copy → attach/commit" proxying.
+    bool proxy_export;
+    uint32_t export_count;
+    struct {
+        int32_t fd;
+        uint32_t offset, stride;
+        uint32_t modifier_lo, modifier_hi;
+        struct wl_buffer *remote;
+        bool busy;
+    } exports[DMABUF_EXPORT_MAX];
 };
 
 struct server_linux_dmabuf *server_linux_dmabuf_create(struct server *server);

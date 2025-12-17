@@ -13,5 +13,5 @@ layout(set = 0, binding = 0) uniform sampler2D u_texture;
 
 void main() {
     vec4 color = texture(u_texture, f_src_pos);
-    out_color = color;
+    out_color = vec4(color.rgb, 1.0); // Force alpha to 1.0
 }

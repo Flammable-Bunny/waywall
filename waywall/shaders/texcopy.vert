@@ -19,7 +19,9 @@ layout(location = 2) out vec4 f_dst_rgba;
 
 void main() {
     gl_Position.x = 2.0 * (v_dst_pos.x / pc.u_dst_size.x) - 1.0;
-    gl_Position.y = 1.0 - 2.0 * (v_dst_pos.y / pc.u_dst_size.y);
+    // Vulkan NDC has +Y pointing down (with a standard, positive-height viewport).
+    // Use a Vulkan-style transform so we can keep pixel coordinates as top-left origin (y down).
+    gl_Position.y = 2.0 * (v_dst_pos.y / pc.u_dst_size.y) - 1.0;
     gl_Position.zw = vec2(0.0, 1.0);
 
     f_src_pos = v_src_pos / pc.u_src_size;

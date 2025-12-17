@@ -8,7 +8,7 @@
 #include "util/log.h"
 #include "util/prelude.h"
 #include "util/syscall.h"
-#include "util/sysinfo.h"
+// #include "util/sysinfo.h"
 #include "wrap.h"
 #include <bits/types/struct_sched_param.h>
 #include <errno.h>
@@ -88,7 +88,7 @@ cmd_wrap(const char *profile, char **argv) {
     }
     util_log_set_file(log_fd);
 
-    sysinfo_dump_log();
+    // sysinfo_dump_log();
 
     struct waywall ww = {0};
 
@@ -276,6 +276,20 @@ main(int argc, char **argv) {
         if (!subcommand || !*subcommand) {
             print_help(argv[0]);
             return 1;
+        }
+
+        // Replace literal "$GAME_SCRIPT"/"$GAMESCRIPT" arguments with the env var value so that
+        // rawCommand wrappers that quote the placeholder still work (including `env ... $GAME_SCRIPT`).
+        for (char **p = subcommand; *p; p++) {
+            if (strcmp(*p, "$GAME_SCRIPT") != 0 && strcmp(*p, "$GAMESCRIPT") != 0) {
+                continue;
+            }
+            const char *gs = getenv("GAME_SCRIPT");
+            if (!gs || !*gs) {
+                fprintf(stderr, "GAME_SCRIPT not set\n");
+                return 1;
+            }
+            *p = (char *)gs;
         }
 
         set_realtime();

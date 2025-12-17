@@ -3,7 +3,6 @@ subdir('lua')
 subdir('shaders')
 
 waywall_src = files(
-  'animation.c',
   'config/api.c',
   'config/config.c',
   'config/internal.c',
@@ -12,7 +11,6 @@ waywall_src = files(
   'server/buffer.c',
   'server/cursor.c',
   'server/fake_input.c',
-  'server/gl.c',
   'server/vk.c',
   'server/server.c',
   'server/ui.c',
@@ -38,7 +36,7 @@ waywall_src = files(
   'util/prelude.c',
   'util/str.c',
   'util/syscall.c',
-  'util/sysinfo.c',
+  'util/syscall.c',
   'util/zip.c',
   'inotify.c',
   'instance.c',

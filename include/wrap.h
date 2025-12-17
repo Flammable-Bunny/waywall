@@ -12,7 +12,6 @@ struct wrap {
     struct config *cfg;
 
     struct server *server;
-    struct server_gl *gl;
     struct server_vk *vk;  // Vulkan backend for cross-GPU sync
     struct scene *scene;
 

@@ -8,7 +8,7 @@
 #include "server/buffer.h"
 #include "server/cursor.h"
 #include "server/fake_input.h"
-#include "server/gl.h"
+// #include "server/gl.h"
 #include "server/vk.h"
 #include "server/server.h"
 #include "server/ui.h"
@@ -40,6 +40,9 @@ struct floating_view {
 
     struct server_view *view;
     int32_t x, y;
+
+    struct vk_view *vk_view;
+    struct wl_listener on_commit;
 };
 
 static void
@@ -78,7 +81,12 @@ floating_find_anchored(struct wrap *wrap) {
 
 static void
 floating_set_visible(struct wrap *wrap, bool visible) {
+    int count = wl_list_length(&wrap->floating.views);
+    ww_log(LOG_INFO, "floating_set_visible: visible=%d, current=%d, floating_views=%d",
+           visible, wrap->floating.visible, count);
+
     if (wrap->floating.visible == visible) {
+        ww_log(LOG_INFO, "floating_set_visible: no change needed");
         return;
     }
 
@@ -86,8 +94,12 @@ floating_set_visible(struct wrap *wrap, bool visible) {
 
     struct floating_view *fview;
     wl_list_for_each (fview, &wrap->floating.views, link) {
+        ww_log(LOG_INFO, "floating_set_visible: setting view %p visible=%d", (void*)fview->view, visible);
         server_view_set_visible(fview->view, visible);
         server_view_commit(fview->view);
+        if (fview->vk_view) {
+            server_vk_view_set_enabled(fview->vk_view, visible);
+        }
     }
 
     if (!visible) {
@@ -198,14 +210,37 @@ floating_view_at(struct wrap *wrap, double x, double y) {
 }
 
 static void
+on_floating_commit(struct wl_listener *listener, void *data) {
+    struct floating_view *fview = wl_container_of(listener, fview, on_commit);
+    ww_log(LOG_INFO, "on_floating_commit: fview=%p, vk_view=%p", (void*)fview, (void*)fview->vk_view);
+    if (fview->vk_view) {
+        struct server_buffer *buffer = server_surface_next_buffer(fview->view->surface);
+        ww_log(LOG_INFO, "on_floating_commit: buffer=%p", (void*)buffer);
+        if (buffer) {
+            server_vk_view_set_buffer(fview->vk_view, buffer);
+            int32_t w, h;
+            server_buffer_get_size(buffer, &w, &h);
+            server_vk_view_set_geometry(fview->vk_view, fview->x, fview->y, w, h);
+            ww_log(LOG_INFO, "on_floating_commit: set geometry x=%d y=%d w=%d h=%d", fview->x, fview->y, w, h);
+        }
+    }
+}
+
+static void
 floating_view_create(struct wrap *wrap, struct server_view *view) {
+    ww_log(LOG_INFO, "floating_view_create: creating floating view for %p, current_visible=%d",
+           (void*)view, wrap->floating.visible);
+
     struct floating_view *fview = zalloc(1, sizeof(*fview));
     fview->view = view;
     wl_list_insert(&wrap->floating.views, &fview->link);
 
-    if (wrap->floating.visible) {
-        server_view_set_visible(view, true);
-    }
+    ww_log(LOG_INFO, "floating_view_create: total floating views now: %d",
+           wl_list_length(&wrap->floating.views));
+
+    // Ensure new floating windows respect the current floating visibility state.
+    // Without this, windows created while floating is hidden can appear "stuck" visible.
+    server_view_set_visible(view, wrap->floating.visible);
 
     if (!SHOULD_ANCHOR(wrap) || wl_list_length(&wrap->floating.views) > 1) {
         server_view_set_centered(view, false);
@@ -218,6 +253,19 @@ floating_view_create(struct wrap *wrap, struct server_view *view) {
 
         server_view_set_centered(view, false);
         floating_update_anchored(wrap);
+    }
+
+    // Ensure floating view is above the Vulkan surface (which renders the game)
+    if (wrap->vk && view->subsurface && wrap->vk->swapchain.wl_surface) {
+        wl_subsurface_place_above(view->subsurface, wrap->vk->swapchain.wl_surface);
+        wl_surface_commit(wrap->server->ui->tree.surface); // Commit parent to apply stacking
+    }
+
+    if (wrap->vk && getenv("WAYWALL_VK_PROXY_GAME") == NULL) {
+        fview->vk_view = server_vk_add_view(wrap->vk, view);
+        fview->on_commit.notify = on_floating_commit;
+        wl_signal_add(&view->surface->events.commit, &fview->on_commit);
+        server_vk_view_set_enabled(fview->vk_view, wrap->floating.visible);
     }
 }
 
@@ -242,6 +290,11 @@ floating_view_destroy(struct wrap *wrap, struct server_view *view) {
             if (wrap->view) {
                 server_set_input_focus(wrap->server, wrap->view);
             }
+        }
+
+        if (fview->vk_view) {
+             server_vk_remove_view(wrap->vk, fview->vk_view);
+             wl_list_remove(&fview->on_commit.link);
         }
 
         wl_list_remove(&fview->link);
@@ -337,7 +390,22 @@ on_view_create(struct wl_listener *listener, void *data) {
     struct wrap *wrap = wl_container_of(listener, wrap, on_view_create);
     struct server_view *view = data;
 
-    if (wrap->view) {
+    // char *debug_title = server_view_get_title(view);
+    char *title = server_view_get_title(view);
+    bool force_floating = false;
+    
+    // Log the title for debugging confirmation
+    ww_log(LOG_INFO, "on_view_create: view=%p, wrap->view=%p, title='%s'", (void*)view, (void*)wrap->view, title ? title : "(null)");
+
+    if (title) {
+        if (strstr(title, "NinjaBrainBot") || strstr(title, "PaceMan")) {
+            force_floating = true;
+        }
+        free(title);
+    }
+
+    if (wrap->view || force_floating) {
+        ww_log(LOG_INFO, "on_view_create: main view exists (or forced), creating floating view");
         floating_view_create(wrap, view);
         return;
     }
@@ -380,14 +448,16 @@ on_view_create(struct wl_listener *listener, void *data) {
     server_view_set_visible(wrap->view, true);
     server_view_commit(wrap->view);
 
-    // HACK: This is so that scene objects (images, mirrors, text) appear over the instance. This is
-    // probably not the best spot to do it, though.
-    // Skip if force_composition is enabled (subsurface won't exist).
     if (wrap->view->subsurface) {
-        wl_subsurface_place_below(wrap->view->subsurface, wrap->view->ui->tree.surface);
+        if (getenv("WAYWALL_VK_PROXY_GAME") != NULL && wrap->vk && wrap->vk->swapchain.wl_surface) {
+            wl_subsurface_place_below(wrap->view->subsurface, wrap->vk->swapchain.wl_surface);
+            wl_surface_commit(wrap->server->ui->tree.surface);
+        } else {
+            wl_subsurface_place_below(wrap->view->subsurface, wrap->view->ui->tree.surface);
+        }
     }
 
-    // Set capture on Vulkan backend for cross-GPU game rendering
+    // Set capture on Vulkan backend for cross-GPU game rendering / proxy export copy.
     if (wrap->vk) {
         server_vk_set_capture(wrap->vk, view->surface);
     }
@@ -546,16 +616,22 @@ wrap_create(struct server *server, struct inotify *inotify, struct ww_timer *tim
     struct wrap *wrap = zalloc(1, sizeof(*wrap));
 
     // Vulkan-only mode for cross-GPU rendering (handles game + overlays)
-    wrap->vk = server_vk_create(server);
+    wrap->vk = server_vk_create(server, cfg);
     if (!wrap->vk) {
         ww_log(LOG_ERROR, "failed to initialize Vulkan backend");
         goto fail_gl;
     }
     ww_log(LOG_INFO, "Vulkan backend initialized for cross-GPU rendering");
 
-    // GL/scene disabled - Vulkan handles everything for better performance
-    wrap->gl = NULL;
-    wrap->scene = NULL;
+    // Initialize scene with Vulkan backend
+    wrap->scene = scene_create(cfg, wrap->vk, server->ui);
+    if (!wrap->scene) {
+        ww_log(LOG_ERROR, "failed to initialize scene");
+        goto fail_scene;
+    }
+    bool proxy_game = getenv("WAYWALL_VK_PROXY_GAME") != NULL;
+    scene_set_vk_active(wrap->scene, !proxy_game);
+
 
     wrap->cfg = cfg;
     wrap->server = server;
@@ -589,16 +665,21 @@ wrap_create(struct server *server, struct inotify *inotify, struct ww_timer *tim
 
     return wrap;
 
-fail_gl:
+fail_scene:
     if (wrap->vk) {
         server_vk_destroy(wrap->vk);
     }
+fail_gl:
     free(wrap);
     return NULL;
 }
 
 void
 wrap_destroy(struct wrap *wrap) {
+    if (wrap && wrap->cfg && wrap->cfg->vm) {
+        config_vm_set_wrap(wrap->cfg->vm, NULL);
+    }
+
     if (wrap->instance) {
         instance_destroy(wrap->instance);
     }
@@ -608,9 +689,6 @@ wrap_destroy(struct wrap *wrap) {
     }
     if (wrap->vk) {
         server_vk_destroy(wrap->vk);
-    }
-    if (wrap->gl) {
-        server_gl_destroy(wrap->gl);
     }
 
     subproc_destroy(wrap->subproc);

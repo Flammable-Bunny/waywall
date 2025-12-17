@@ -13,8 +13,8 @@ layout(push_constant) uniform PushConstants {
 void main() {
     vec4 color = texture(u_texture, f_uv);
     if (pc.swap_colors != 0) {
-        out_color = vec4(color.b, color.g, color.r, color.a);
+        out_color = vec4(color.b, color.g, color.r, 1.0); // Force alpha to 1.0
     } else {
-        out_color = color;
+        out_color = vec4(color.r, color.g, color.b, 1.0); // Force alpha to 1.0
     }
 }

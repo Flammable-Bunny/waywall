@@ -33,6 +33,7 @@ struct server_ui {
     struct zxdg_toplevel_decoration_v1 *xdg_decoration;
 
     int32_t width, height;
+    int32_t refresh_mhz;
     bool mapped, resize, fullscreen;
 
     struct wl_list views; // server_view.link
@@ -40,6 +41,7 @@ struct server_ui {
     struct {
         struct wl_signal close;        // data: NULL
         struct wl_signal resize;       // data: NULL
+        struct wl_signal refresh;      // data: NULL
         struct wl_signal view_create;  // data: struct server_view *
         struct wl_signal view_destroy; // data: struct server_view *
     } events;

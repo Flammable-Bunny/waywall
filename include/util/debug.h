@@ -38,6 +38,7 @@ extern struct util_debug {
 
     struct {
         int32_t width, height;
+        int32_t refresh_mhz;
 
         bool fullscreen;
     } ui;

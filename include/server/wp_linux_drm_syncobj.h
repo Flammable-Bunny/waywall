@@ -32,7 +32,13 @@ struct server_drm_syncobj_surface {
     struct wl_listener on_surface_destroy;
 
     struct server_drm_syncobj_point {
+        // A dup() of the client's timeline fd. This stays stable across
+        // set_{acquire,release}_point calls for the same timeline.
         int32_t fd;
+        // The original timeline fd (as seen by the client/server object) that
+        // `fd` was duplicated from. Used to avoid dup()/close() churn every
+        // frame when only the point value changes.
+        int32_t timeline_fd;
         uint32_t point_hi, point_lo;
     } acquire, release;
 };

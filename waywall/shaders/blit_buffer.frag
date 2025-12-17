@@ -8,20 +8,25 @@ layout(set = 0, binding = 0) readonly buffer PixelData {
     uint pixels[];
 } pixel_data;
 
-// Push constants for stride-aware sampling and dual-GPU color swap
+// Push constants for stride-aware sampling with source cropping
 layout(push_constant) uniform PushConstants {
-    int width;        // Image width in pixels
-    int height;       // Image height in pixels
+    int width;        // Full game width in pixels
+    int height;       // Full game height in pixels
     int stride;       // Actual stride in bytes (from dma-buf)
     int swap_colors;  // 0 = normal, 1 = swap R and B channels
+    // Source crop region (for tall/wide resolutions)
+    int src_x;        // Source X offset in game pixels
+    int src_y;        // Source Y offset in game pixels
+    int src_w;        // Source width in game pixels
+    int src_h;        // Source height in game pixels
 } pc;
 
 void main() {
-    // Calculate pixel coordinates from UV
-    int px = int(f_uv.x * float(pc.width));
-    int py = int(f_uv.y * float(pc.height));
+    // Map UV (0-1) to source crop region in game
+    int px = pc.src_x + int(f_uv.x * float(pc.src_w));
+    int py = pc.src_y + int(f_uv.y * float(pc.src_h));
 
-    // Clamp to valid range
+    // Clamp to game bounds
     px = clamp(px, 0, pc.width - 1);
     py = clamp(py, 0, pc.height - 1);
 

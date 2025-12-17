@@ -1,4 +1,5 @@
 #include "server/xwm.h"
+#include "server/buffer.h"
 #include "server/server.h"
 #include "server/ui.h"
 #include "server/wl_compositor.h"
@@ -132,6 +133,7 @@ struct xsurface {
 
     struct xwm *xwm;
     xcb_window_t window;
+    bool override_redirect;
 
     struct {
         enum {
@@ -168,6 +170,7 @@ struct unpaired_surface {
 
 static void on_surface_commit(struct wl_listener *listener, void *data);
 static void on_surface_destroy(struct wl_listener *listener, void *data);
+static void xsurface_update_view(struct xsurface *xsurface, bool commit);
 static void on_xwayland_surface_destroy(struct wl_listener *listener, void *data);
 static void on_xwayland_surface_set_serial(struct wl_listener *listener, void *data);
 
@@ -298,8 +301,8 @@ upsurface_destroy(struct unpaired_surface *upsurface) {
 
 static struct xsurface *
 xsurface_create(struct xwm *xwm, xcb_window_t window) {
-    // Subscribe to property changes on this window.
-    static const uint32_t mask[] = {XCB_EVENT_MASK_PROPERTY_CHANGE};
+    // Subscribe to property changes and structure events (map/unmap) on this window.
+    static const uint32_t mask[] = {XCB_EVENT_MASK_PROPERTY_CHANGE | XCB_EVENT_MASK_STRUCTURE_NOTIFY};
     xcb_change_window_attributes(xwm->conn, window, XCB_CW_EVENT_MASK, mask);
 
     // Create the xsurface object.
@@ -309,9 +312,21 @@ xsurface_create(struct xwm *xwm, xcb_window_t window) {
     xsurface->window = window;
 
     xsurface->pid = get_window_pid(xwm, window);
+    xsurface->override_redirect = false;
     xsurface->association.type = ASSOC_NONE;
 
     wl_list_insert(&xwm->surfaces, &xsurface->link);
+
+    // Check if window is already mapped (handling race condition for override-redirect)
+    xcb_get_window_attributes_cookie_t cookie = xcb_get_window_attributes(xwm->conn, window);
+    xcb_get_window_attributes_reply_t *attr = xcb_get_window_attributes_reply(xwm->conn, cookie, NULL);
+    if (attr) {
+        if (attr->map_state == XCB_MAP_STATE_VIEWABLE) {
+            ww_log(LOG_INFO, "xsurface %" PRIu32 " already mapped", (uint32_t)window);
+            xsurface->mapped_x11 = true;
+        }
+        free(attr);
+    }
 
     ww_log(LOG_INFO, "xsurface created for window %" PRIu32, (uint32_t)window);
     return xsurface;
@@ -319,6 +334,11 @@ xsurface_create(struct xwm *xwm, xcb_window_t window) {
 
 static void
 xsurface_destroy(struct xsurface *xsurface) {
+    if (xsurface->view) {
+        server_view_destroy(xsurface->view);
+        xsurface->view = NULL;
+    }
+
     if (xsurface->parent) {
         wl_list_remove(&xsurface->on_surface_commit.link);
         wl_list_remove(&xsurface->on_surface_destroy.link);
@@ -328,11 +348,7 @@ xsurface_destroy(struct xsurface *xsurface) {
         free(xsurface->title);
     }
 
-    ww_assert(!xsurface->view);
-
     wl_list_remove(&xsurface->link);
-
-    ww_log(LOG_INFO, "xsurface destroyed for window %" PRIu32, (uint32_t)xsurface->window);
     free(xsurface);
 }
 
@@ -360,16 +376,18 @@ xsurface_pair(struct xsurface *xsurface, struct server_surface *surface) {
     xsurface->on_surface_destroy.notify = on_surface_destroy;
     wl_signal_add(&surface->events.destroy, &xsurface->on_surface_destroy);
 
-    ww_log(LOG_INFO, "associated X11 window %" PRIu32 " with server_surface %p",
-           (uint32_t)xsurface->window, surface);
+    // Treat newly paired windows as mapped; override-redirect windows never emit MAP_REQUEST, and
+    // some toolkits (e.g., Java AWT on Xwayland) skip explicit map transitions. This lets them
+    // get a server_view as soon as they have a buffer.
+    xsurface->mapped_x11 = true;
+
+    // Attempt to create/destroy the view immediately based on current buffer state.
+    xsurface_update_view(xsurface, false);
 }
 
 static void
 xsurface_unpair(struct xsurface *xsurface) {
     ww_assert(xsurface->parent);
-
-    ww_log(LOG_INFO, "deassociated X11 window %" PRIu32 " with server_surface %p",
-           (uint32_t)xsurface->window, xsurface->parent);
 
     xsurface->parent = NULL;
 
@@ -385,29 +403,21 @@ xsurface_update_view(struct xsurface *xsurface, bool commit) {
         return;
     }
 
-    // If the associated Wayland surface does not have a buffer, it must not be given a server_view.
+    // Check if surface has a buffer attached.
     bool has_buffer;
     if (commit) {
-        // Determine whether or not the associated Wayland surface will have a buffer attached after
-        // this commit completes.
         has_buffer = !!server_surface_next_buffer(xsurface->parent);
     } else {
         has_buffer = !!xsurface->parent->current.buffer;
     }
 
-    // If the surface is not mapped in the X11 session, it should not be mapped by the compositor
-    // either.
-    bool mapped_x11 = xsurface->mapped_x11;
-
-    // Determine whether or not the X11 window should have a server_view associated with it. Create
-    // or destroy the server_view if necessary.
-    bool should_map = has_buffer && mapped_x11;
-
-    if (should_map && !xsurface->view) {
+    // Create or destroy the server_view based on buffer presence.
+    // We always treat surfaces as "mapped" since Java AWT on NixOS doesn't emit proper map events.
+    if (has_buffer && !xsurface->view) {
         xsurface->view = server_view_create(xsurface->xwm->server->ui, xsurface->parent,
                                             &xwayland_view_impl, xsurface);
         ww_assert(xsurface->view);
-    } else if (!should_map && xsurface->view) {
+    } else if (!has_buffer && xsurface->view) {
         server_view_destroy(xsurface->view);
         xsurface->view = NULL;
     }
@@ -612,15 +622,15 @@ handle_xcb_create_notify(struct xwm *xwm, xcb_create_notify_event_t *event) {
         return;
     }
 
-    if (event->override_redirect) {
-        ww_log(LOG_WARN,
-               "X11 client attempted to create window (%" PRIu32 ") with override redirect",
-               (uint32_t)event->window);
-        xcb_kill_client(xwm->conn, event->window);
-        return;
+    struct xsurface *xs = xsurface_create(xwm, event->window);
+    if (xs) {
+        xs->override_redirect = event->override_redirect;
+        if (xs->override_redirect) {
+            // Override-redirect windows never send MAP_REQUEST to the WM. Treat them as mapped once
+            // they exist so they can get a server_view when their Wayland surface appears.
+            xs->mapped_x11 = true;
+        }
     }
-
-    xsurface_create(xwm, event->window);
 }
 
 static void
@@ -637,7 +647,6 @@ handle_xcb_destroy_notify(struct xwm *xwm, xcb_destroy_notify_event_t *event) {
 static void
 handle_xcb_map_request(struct xwm *xwm, xcb_map_request_event_t *event) {
     struct xsurface *xsurface = xsurface_lookup(xwm, event->window);
-
     if (!xsurface) {
         return;
     }
@@ -645,6 +654,19 @@ handle_xcb_map_request(struct xwm *xwm, xcb_map_request_event_t *event) {
     xcb_map_window(xwm->conn, event->window);
     xsurface->mapped_x11 = true;
     xsurface_update_view(xsurface, false);
+}
+
+static void
+handle_xcb_map_notify(struct xwm *xwm, xcb_map_notify_event_t *event) {
+    struct xsurface *xsurface = xsurface_lookup(xwm, event->window);
+    if (!xsurface) {
+        return;
+    }
+
+    if (!xsurface->mapped_x11) {
+        xsurface->mapped_x11 = true;
+        xsurface_update_view(xsurface, false);
+    }
 }
 
 static void
@@ -801,7 +823,7 @@ handle_x11_conn(int32_t fd, uint32_t mask, void *data) {
             handle_xcb_destroy_notify(xwm, (xcb_destroy_notify_event_t *)event);
             break;
         case XCB_MAP_NOTIFY:
-            // Unused.
+            handle_xcb_map_notify(xwm, (xcb_map_notify_event_t *)event);
             break;
         case XCB_MAPPING_NOTIFY:
             // Unused.

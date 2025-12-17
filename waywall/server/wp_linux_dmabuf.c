@@ -9,6 +9,8 @@
 #include "util/alloc.h"
 #include "util/log.h"
 #include "util/prelude.h"
+#include <drm/drm_fourcc.h>
+#include <gbm.h>
 #include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,15 +20,6 @@
 #include <linux/memfd.h>
 #include <sys/syscall.h>
 #include <unistd.h>
-
-// DRM format codes
-#define DRM_FORMAT_XRGB8888 0x34325258
-#define DRM_FORMAT_ARGB8888 0x34325241
-#define DRM_FORMAT_XBGR8888 0x34324258
-#define DRM_FORMAT_ABGR8888 0x34324241
-
-// DRM_FORMAT_MOD_LINEAR
-#define DRM_FORMAT_MOD_LINEAR 0ULL
 
 // memfd_create wrapper (in case libc doesn't provide it)
 static inline int ww_memfd_create(const char *name, unsigned int flags) {
@@ -38,8 +31,21 @@ static inline int ww_memfd_create(const char *name, unsigned int flags) {
 
 #define SRV_LINUX_DMABUF_VERSION 4
 
+static const struct zwp_linux_buffer_params_v1_listener linux_buffer_params_listener;
+
 static void
 destroy_dmabuf_buffer_data(struct server_dmabuf_data *data) {
+    for (size_t i = 0; i < data->export_count; i++) {
+        if (data->exports[i].remote) {
+            wl_buffer_destroy(data->exports[i].remote);
+            data->exports[i].remote = NULL;
+        }
+        if (data->exports[i].fd != -1) {
+            close(data->exports[i].fd);
+            data->exports[i].fd = -1;
+        }
+    }
+
     for (size_t i = 0; i < data->num_planes; i++) {
         close(data->planes[i].fd);
     }
@@ -67,6 +73,119 @@ static const struct server_buffer_impl dmabuf_buffer_impl = {
     .destroy = dmabuf_buffer_destroy,
     .size = dmabuf_buffer_size,
 };
+
+static void
+on_export_wl_buffer_release(void *data, struct wl_buffer *wl_buffer) {
+    (void)wl_buffer;
+    bool *busy = data;
+    *busy = false;
+}
+
+static const struct wl_buffer_listener export_wl_buffer_listener = {
+    .release = on_export_wl_buffer_release,
+};
+
+static struct wl_buffer *
+create_export_wl_buffer(struct server_linux_dmabuf *linux_dmabuf, int32_t width, int32_t height,
+                        uint32_t format, uint32_t flags, int fd, uint32_t stride,
+                        uint32_t modifier_hi, uint32_t modifier_lo) {
+    struct server_linux_buffer_params params = {0};
+    params.parent = linux_dmabuf;
+    params.status = BUFFER_PARAMS_STATUS_UNKNOWN;
+
+    params.remote = zwp_linux_dmabuf_v1_create_params(linux_dmabuf->remote);
+    check_alloc(params.remote);
+    zwp_linux_buffer_params_v1_add_listener(params.remote, &linux_buffer_params_listener, &params);
+
+    zwp_linux_buffer_params_v1_add(params.remote, fd, 0, 0, stride, modifier_hi, modifier_lo);
+    zwp_linux_buffer_params_v1_create(params.remote, width, height, format, flags);
+
+    wl_display_roundtrip_queue(linux_dmabuf->remote_display, linux_dmabuf->queue);
+
+    if (params.status != BUFFER_PARAMS_STATUS_OK || !params.ok_buffer) {
+        if (params.remote) {
+            zwp_linux_buffer_params_v1_destroy(params.remote);
+        }
+        return NULL;
+    }
+
+    wl_proxy_set_queue((struct wl_proxy *)params.ok_buffer, linux_dmabuf->main_queue);
+
+    struct wl_buffer *ok = params.ok_buffer;
+    params.ok_buffer = NULL;
+    zwp_linux_buffer_params_v1_destroy(params.remote);
+    return ok;
+}
+
+static bool
+dmabuf_setup_export_buffers(struct server_linux_dmabuf *linux_dmabuf, struct server_dmabuf_data *data) {
+    // Currently only needed/implemented for the common 1-plane RGB formats.
+    if (data->num_planes != 1) {
+        ww_log(LOG_ERROR, "proxy export: unsupported plane count: %u", data->num_planes);
+        return false;
+    }
+
+    if (!linux_dmabuf->export_gbm) {
+        ww_log(LOG_ERROR, "proxy export: no GBM device available");
+        return false;
+    }
+
+    data->proxy_export = true;
+    data->export_count = 0;
+    for (size_t i = 0; i < STATIC_ARRLEN(data->exports); i++) {
+        data->exports[i].fd = -1;
+    }
+
+    for (uint32_t i = 0; i < DMABUF_EXPORT_MAX; i++) {
+        struct gbm_bo *bo = gbm_bo_create(linux_dmabuf->export_gbm, data->width, data->height,
+                                          data->format, GBM_BO_USE_RENDERING);
+        if (!bo) {
+            ww_log(LOG_ERROR, "proxy export: gbm_bo_create failed for %dx%d format=0x%x",
+                   data->width, data->height, data->format);
+            break;
+        }
+
+        int bo_fd = gbm_bo_get_fd(bo);
+        uint32_t bo_stride = gbm_bo_get_stride(bo);
+        uint64_t bo_mod = gbm_bo_get_modifier(bo);
+        gbm_bo_destroy(bo);
+
+        if (bo_fd < 0 || bo_stride == 0) {
+            ww_log(LOG_ERROR, "proxy export: gbm_bo_get_fd/stride failed");
+            if (bo_fd >= 0) {
+                close(bo_fd);
+            }
+            break;
+        }
+
+        struct wl_buffer *wl_buf = create_export_wl_buffer(
+            linux_dmabuf, data->width, data->height, data->format, data->flags, bo_fd, bo_stride,
+            (uint32_t)(bo_mod >> 32), (uint32_t)bo_mod);
+        if (!wl_buf) {
+            ww_log(LOG_ERROR, "proxy export: failed to create wl_buffer on host compositor");
+            close(bo_fd);
+            break;
+        }
+
+        data->exports[i].fd = bo_fd;
+        data->exports[i].offset = 0;
+        data->exports[i].stride = bo_stride;
+        data->exports[i].modifier_hi = (uint32_t)(bo_mod >> 32);
+        data->exports[i].modifier_lo = (uint32_t)bo_mod;
+        data->exports[i].remote = wl_buf;
+        data->exports[i].busy = false;
+        wl_buffer_add_listener(wl_buf, &export_wl_buffer_listener, &data->exports[i].busy);
+
+        data->export_count++;
+    }
+
+    if (data->export_count == 0) {
+        data->proxy_export = false;
+        return false;
+    }
+
+    return true;
+}
 
 static bool
 check_buffer_params(struct server_linux_buffer_params *buffer_params) {
@@ -104,20 +223,37 @@ create_buffer(struct server_linux_buffer_params *buffer_params, struct wl_resour
     buffer_params->data->format = format;
     buffer_params->data->flags = flags;
 
-    // For cross-GPU scenarios, create buffer locally without forwarding to parent compositor.
-    // The Vulkan backend will import the dma-buf directly using VK_EXT_external_memory_dma_buf.
-    // This avoids the cross-GPU import failure on the host compositor side.
-    //
-    // We create a "local-only" buffer that stores the dma-buf data but doesn't have a
-    // corresponding wl_buffer on the parent compositor. The Vulkan backend handles rendering.
+    if (buffer_params->parent->proxy_game) {
+        ww_log(LOG_INFO,
+               "dmabuf proxy create: %dx%d format=0x%x flags=%u planes=%u modifier=%#" PRIx64,
+               width, height, format, flags, buffer_params->data->num_planes,
+               ((uint64_t)buffer_params->data->modifier_hi << 32) | buffer_params->data->modifier_lo);
+
+        // Proxy-export mode: allocate exportable buffers on the compositor GPU and use Vulkan
+        // to copy the client dmabuf into those buffers. This avoids requiring the host compositor
+        // to import the client’s cross-GPU dmabuf directly.
+        if (!dmabuf_setup_export_buffers(buffer_params->parent, buffer_params->data)) {
+            buffer_params->status = BUFFER_PARAMS_STATUS_NOT_OK;
+            return;
+        }
+
+        buffer_params->buffer =
+            server_buffer_create(buffer_resource, buffer_params->data->exports[0].remote,
+                                 &dmabuf_buffer_impl, buffer_params->data);
+        buffer_params->status = BUFFER_PARAMS_STATUS_OK;
+        return;
+    }
+
+    // Default (composition) mode: create a "local-only" buffer that stores the dma-buf data but
+    // does not have a corresponding wl_buffer on the parent compositor. The Vulkan backend will
+    // import the dma-buf directly.
     ww_log(LOG_INFO, "creating local-only dmabuf: %dx%d, format=0x%x, modifier=0x%llx",
            width, height, format,
            (unsigned long long)(((uint64_t)buffer_params->data->modifier_hi << 32) |
                                 buffer_params->data->modifier_lo));
 
-    // Create server_buffer with NULL remote buffer - this marks it as local-only
-    buffer_params->buffer = server_buffer_create(buffer_resource, NULL,
-                                                 &dmabuf_buffer_impl, buffer_params->data);
+    buffer_params->buffer =
+        server_buffer_create(buffer_resource, NULL, &dmabuf_buffer_impl, buffer_params->data);
     buffer_params->status = BUFFER_PARAMS_STATUS_OK;
 }
 
@@ -129,6 +265,9 @@ on_linux_buffer_params_created(void *data, struct zwp_linux_buffer_params_v1 *wl
     // Move the created buffer off of the linux_dmabuf queue and onto the main display queue.
     wl_proxy_set_queue((struct wl_proxy *)buffer, buffer_params->parent->main_queue);
 
+    ww_log(LOG_INFO, "dmabuf params created by host compositor (proxy_game=%d)",
+           buffer_params->parent->proxy_game);
+
     buffer_params->ok_buffer = buffer;
     buffer_params->status = BUFFER_PARAMS_STATUS_OK;
 }
@@ -136,6 +275,20 @@ on_linux_buffer_params_created(void *data, struct zwp_linux_buffer_params_v1 *wl
 static void
 on_linux_buffer_params_failed(void *data, struct zwp_linux_buffer_params_v1 *wl) {
     struct server_linux_buffer_params *buffer_params = data;
+
+    if (buffer_params->data) {
+        ww_log(LOG_ERROR,
+               "dmabuf params FAILED in host compositor (proxy_game=%d): %dx%d format=0x%x flags=%u modifier=%#" PRIx64
+               " planes=%u stride0=%u",
+               buffer_params->parent->proxy_game, buffer_params->data->width, buffer_params->data->height,
+               buffer_params->data->format, buffer_params->data->flags,
+               ((uint64_t)buffer_params->data->modifier_hi << 32) | buffer_params->data->modifier_lo,
+               buffer_params->data->num_planes,
+               buffer_params->data->num_planes ? buffer_params->data->planes[0].stride : 0);
+    } else {
+        ww_log(LOG_ERROR, "dmabuf params FAILED in host compositor (proxy_game=%d)",
+               buffer_params->parent->proxy_game);
+    }
 
     buffer_params->status = BUFFER_PARAMS_STATUS_NOT_OK;
 }
@@ -163,6 +316,59 @@ static void
 on_linux_dmabuf_feedback_format_table(void *data, struct zwp_linux_dmabuf_feedback_v1 *wl,
                                       int32_t fd, uint32_t size) {
     struct server_linux_dmabuf_feedback *feedback = data;
+
+    if (feedback->parent->proxy_game) {
+        ww_log(LOG_INFO, "dmabuf feedback: passing through format table (proxy_game=1)");
+        zwp_linux_dmabuf_feedback_v1_send_format_table(feedback->resource, fd, size);
+        close(fd);
+        return;
+    }
+
+    if (feedback->parent->force_intel_feedback) {
+        // Override with a modifier-capable table (include a sample tiled modifier to hint clients)
+        struct format_table_entry entries[] = {
+            { DRM_FORMAT_XRGB8888, 0, DRM_FORMAT_MOD_LINEAR },
+            { DRM_FORMAT_ARGB8888, 0, DRM_FORMAT_MOD_LINEAR },
+            { DRM_FORMAT_XBGR8888, 0, DRM_FORMAT_MOD_LINEAR },
+            { DRM_FORMAT_ABGR8888, 0, DRM_FORMAT_MOD_LINEAR },
+            // Add explicit Intel tiling modifier to hint clients
+            { DRM_FORMAT_XRGB8888, 0, fourcc_mod_code(INTEL, 1) }, // INTEL_X_TILED
+        };
+
+        size_t table_size = sizeof(entries);
+        close(fd); // drop host table
+
+        int new_fd = ww_memfd_create("dmabuf-format-table", MFD_CLOEXEC);
+        if (new_fd < 0) {
+            ww_log(LOG_ERROR, "failed to create memfd for modifier format table");
+            return;
+        }
+        if (ftruncate(new_fd, table_size) < 0) {
+            ww_log(LOG_ERROR, "failed to truncate modifier format table fd");
+            close(new_fd);
+            return;
+        }
+        void *map = mmap(NULL, table_size, PROT_READ | PROT_WRITE, MAP_SHARED, new_fd, 0);
+        if (map == MAP_FAILED) {
+            ww_log(LOG_ERROR, "failed to mmap modifier format table");
+            close(new_fd);
+            return;
+        }
+        memcpy(map, entries, table_size);
+        munmap(map, table_size);
+
+        ww_log(LOG_INFO, "dmabuf feedback: overriding format table for Intel (mods + linear)");
+        zwp_linux_dmabuf_feedback_v1_send_format_table(feedback->resource, new_fd, table_size);
+        close(new_fd);
+        return;
+    }
+
+    if (feedback->parent->allow_modifiers) {
+        ww_log(LOG_INFO, "dmabuf feedback: passing through modifier table (no LINEAR override)");
+        zwp_linux_dmabuf_feedback_v1_send_format_table(feedback->resource, fd, size);
+        close(fd);
+        return;
+    }
 
     // Close AMD's format table - we'll send our own with LINEAR formats only
     close(fd);
@@ -211,10 +417,23 @@ on_linux_dmabuf_feedback_main_device(void *data, struct zwp_linux_dmabuf_feedbac
                                      struct wl_array *device) {
     struct server_linux_dmabuf_feedback *feedback = data;
 
-    // Pass through upstream device feedback unchanged.
-    // Minecraft (subprocess on Intel with DRI_PRIME=1) will create buffers on Intel.
-    // Waywall (on AMD) will receive and display those Intel buffers.
-    zwp_linux_dmabuf_feedback_v1_send_main_device(feedback->resource, device);
+    if (feedback->parent->proxy_game) {
+        zwp_linux_dmabuf_feedback_v1_send_main_device(feedback->resource, device);
+        return;
+    }
+
+    if (feedback->parent->force_intel_feedback) {
+        struct wl_array dev_arr;
+        wl_array_init(&dev_arr);
+        dev_t *dev = wl_array_add(&dev_arr, sizeof(dev_t));
+        *dev = makedev(226, 129); // Intel renderD129
+        ww_log(LOG_INFO, "dmabuf feedback: overriding main_device to renderD129 (Intel)");
+        zwp_linux_dmabuf_feedback_v1_send_main_device(feedback->resource, &dev_arr);
+        wl_array_release(&dev_arr);
+    } else {
+        // Pass through upstream device feedback unchanged.
+        zwp_linux_dmabuf_feedback_v1_send_main_device(feedback->resource, device);
+    }
 }
 
 static void
@@ -236,6 +455,24 @@ static void
 on_linux_dmabuf_feedback_tranche_formats(void *data, struct zwp_linux_dmabuf_feedback_v1 *wl,
                                          struct wl_array *indices) {
     struct server_linux_dmabuf_feedback *feedback = data;
+
+    if (feedback->parent->proxy_game) {
+        zwp_linux_dmabuf_feedback_v1_send_tranche_formats(feedback->resource, indices);
+        return;
+    }
+
+    if (feedback->parent->force_intel_feedback) {
+        // Allow all provided formats (including modifiers) when forcing Intel
+        ww_log(LOG_INFO, "dmabuf feedback: passing through tranche_formats (Intel forced)");
+        zwp_linux_dmabuf_feedback_v1_send_tranche_formats(feedback->resource, indices);
+        return;
+    }
+
+    if (feedback->parent->allow_modifiers) {
+        ww_log(LOG_INFO, "dmabuf feedback: passing through tranche formats (modifiers allowed)");
+        zwp_linux_dmabuf_feedback_v1_send_tranche_formats(feedback->resource, indices);
+        return;
+    }
 
     // Always override to use indices 0-3 (our 4 LINEAR formats).
     // Waywall's GL pipeline can only handle LINEAR modifiers, regardless of compositor mode.
@@ -259,9 +496,23 @@ on_linux_dmabuf_feedback_tranche_target_device(void *data, struct zwp_linux_dmab
                                                struct wl_array *device) {
     struct server_linux_dmabuf_feedback *feedback = data;
 
-    // Pass through upstream device feedback unchanged.
-    // Minecraft will render to Intel, Waywall will display those buffers.
-    zwp_linux_dmabuf_feedback_v1_send_tranche_target_device(feedback->resource, device);
+    if (feedback->parent->proxy_game) {
+        zwp_linux_dmabuf_feedback_v1_send_tranche_target_device(feedback->resource, device);
+        return;
+    }
+
+    if (feedback->parent->force_intel_feedback) {
+        struct wl_array dev_arr;
+        wl_array_init(&dev_arr);
+        dev_t *dev = wl_array_add(&dev_arr, sizeof(dev_t));
+        *dev = makedev(226, 129); // Intel renderD129
+        ww_log(LOG_INFO, "dmabuf feedback: overriding tranche target_device to renderD129 (Intel)");
+        zwp_linux_dmabuf_feedback_v1_send_tranche_target_device(feedback->resource, &dev_arr);
+        wl_array_release(&dev_arr);
+    } else {
+        // Pass through upstream device feedback unchanged.
+        zwp_linux_dmabuf_feedback_v1_send_tranche_target_device(feedback->resource, device);
+    }
 }
 
 static const struct zwp_linux_dmabuf_feedback_v1_listener linux_dmabuf_feedback_listener = {
@@ -282,7 +533,9 @@ linux_buffer_params_resource_destroy(struct wl_resource *resource) {
         destroy_dmabuf_buffer_data(buffer_params->data);
     }
 
-    zwp_linux_buffer_params_v1_destroy(buffer_params->remote);
+    if (buffer_params->remote) {
+        zwp_linux_buffer_params_v1_destroy(buffer_params->remote);
+    }
     free(buffer_params);
 }
 
@@ -328,10 +581,10 @@ linux_buffer_params_add(struct wl_client *client, struct wl_resource *resource, 
     ww_log(LOG_INFO, "dmabuf add plane: fd=%d, plane_idx=%d, offset=%u, stride=%u, modifier=%#" PRIx64,
            fd, plane_idx, offset, stride, ((uint64_t)modifier_hi << 32) | modifier_lo);
 
-    // Pass the original modifier to Hyprland - let Hyprland handle cross-GPU import
-    // Hyprland has its own mechanisms for GPU-to-GPU VRAM transfers
-    zwp_linux_buffer_params_v1_add(buffer_params->remote, fd, plane_idx, offset, stride,
-                                   modifier_hi, modifier_lo);
+    if (!buffer_params->parent->proxy_game) {
+        zwp_linux_buffer_params_v1_add(buffer_params->remote, fd, plane_idx, offset, stride,
+                                       modifier_hi, modifier_lo);
+    }
 }
 
 static void
@@ -378,6 +631,11 @@ linux_buffer_params_create_immed(struct wl_client *client, struct wl_resource *r
     if (!check_buffer_params(buffer_params)) {
         return;
     }
+
+    ww_log(LOG_INFO,
+           "dmabuf create_immed: id=%u width=%d height=%d format=0x%x flags=%u num_planes=%u modifier=%#" PRIx64,
+           id, width, height, format, flags, buffer_params->data->num_planes,
+           ((uint64_t)buffer_params->data->modifier_hi << 32) | buffer_params->data->modifier_lo);
 
     struct wl_resource *buffer_resource = wl_resource_create(client, &wl_buffer_interface, 1, id);
     check_alloc(buffer_resource);
@@ -453,12 +711,14 @@ linux_dmabuf_create_params(struct wl_client *client, struct wl_resource *resourc
     wl_resource_set_implementation(buffer_params->resource, &linux_buffer_params_impl,
                                    buffer_params, linux_buffer_params_resource_destroy);
 
-    buffer_params->remote = zwp_linux_dmabuf_v1_create_params(linux_dmabuf->remote);
-    check_alloc(buffer_params->remote);
+    if (!linux_dmabuf->proxy_game) {
+        buffer_params->remote = zwp_linux_dmabuf_v1_create_params(linux_dmabuf->remote);
+        check_alloc(buffer_params->remote);
 
-    zwp_linux_buffer_params_v1_add_listener(buffer_params->remote, &linux_buffer_params_listener,
-                                            buffer_params);
-    wl_display_roundtrip_queue(linux_dmabuf->remote_display, linux_dmabuf->queue);
+        zwp_linux_buffer_params_v1_add_listener(buffer_params->remote, &linux_buffer_params_listener,
+                                                buffer_params);
+        wl_display_roundtrip_queue(linux_dmabuf->remote_display, linux_dmabuf->queue);
+    }
 
     return;
 }
@@ -641,6 +901,15 @@ on_display_destroy(struct wl_listener *listener, void *data) {
     wl_proxy_wrapper_destroy(linux_dmabuf->remote);
     wl_event_queue_destroy(linux_dmabuf->queue);
 
+    if (linux_dmabuf->export_gbm) {
+        gbm_device_destroy(linux_dmabuf->export_gbm);
+        linux_dmabuf->export_gbm = NULL;
+    }
+    if (linux_dmabuf->export_drm_fd >= 0) {
+        close(linux_dmabuf->export_drm_fd);
+        linux_dmabuf->export_drm_fd = -1;
+    }
+
     wl_list_remove(&linux_dmabuf->on_display_destroy.link);
 
     free(linux_dmabuf);
@@ -650,6 +919,7 @@ struct server_linux_dmabuf *
 server_linux_dmabuf_create(struct server *server) {
     struct server_linux_dmabuf *linux_dmabuf = zalloc(1, sizeof(*linux_dmabuf));
     linux_dmabuf->server = server;
+    linux_dmabuf->export_drm_fd = -1;
 
     linux_dmabuf->global = wl_global_create(server->display, &zwp_linux_dmabuf_v1_interface,
                                             SRV_LINUX_DMABUF_VERSION, linux_dmabuf, on_global_bind);
@@ -668,6 +938,45 @@ server_linux_dmabuf_create(struct server *server) {
     linux_dmabuf->remote = wl_proxy_create_wrapper(server->backend->linux_dmabuf);
     check_alloc(linux_dmabuf->remote);
     wl_proxy_set_queue((struct wl_proxy *)linux_dmabuf->remote, linux_dmabuf->queue);
+
+    // Proxy mode must create dmabufs that the *parent compositor* can import. Overriding dmabuf
+    // feedback to “Intel” (or pushing Intel-only modifiers) can cause the parent compositor to
+    // reject wl_buffer creation entirely.
+    linux_dmabuf->proxy_game = getenv("WAYWALL_VK_PROXY_GAME") != NULL;
+
+    // In proxy mode we need a GBM device to allocate export dma-bufs on the compositor GPU.
+    const char *gbm_path = getenv("GBM_DEVICE");
+    if (!gbm_path || !*gbm_path) {
+        gbm_path = "/dev/dri/renderD128";
+    }
+    linux_dmabuf->export_drm_fd = open(gbm_path, O_RDWR | O_CLOEXEC);
+    if (linux_dmabuf->export_drm_fd >= 0) {
+        linux_dmabuf->export_gbm = gbm_create_device(linux_dmabuf->export_drm_fd);
+        if (!linux_dmabuf->export_gbm) {
+            ww_log(LOG_WARN, "proxy export: failed to create GBM device for %s", gbm_path);
+            close(linux_dmabuf->export_drm_fd);
+            linux_dmabuf->export_drm_fd = -1;
+        }
+    } else {
+        ww_log(LOG_WARN, "proxy export: failed to open GBM device %s", gbm_path);
+    }
+
+    // If we're intentionally offloading the subprocess to another GPU (DRI_PRIME set), pass
+    // through modifiers by default to avoid forced LINEAR/CPU fallbacks. Still allow an explicit
+    // env override for troubleshooting.
+    linux_dmabuf->allow_modifiers =
+        getenv("WAYWALL_DMABUF_ALLOW_MODIFIERS") || server->subprocess_dri_prime;
+
+    // Force Intel render node feedback if requested; default renderD129 (226:129).
+    linux_dmabuf->force_intel_feedback = getenv("WAYWALL_DMABUF_FORCE_INTEL") != NULL;
+
+    if (linux_dmabuf->proxy_game) {
+        linux_dmabuf->force_intel_feedback = false;
+    }
+
+    ww_log(LOG_INFO, "dmabuf: allow_modifiers=%d force_intel_feedback=%d (proxy_game=%d)",
+           linux_dmabuf->allow_modifiers, linux_dmabuf->force_intel_feedback,
+           linux_dmabuf->proxy_game);
 
     linux_dmabuf->on_display_destroy.notify = on_display_destroy;
     wl_display_add_destroy_listener(server->display, &linux_dmabuf->on_display_destroy);

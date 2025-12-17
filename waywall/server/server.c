@@ -234,9 +234,14 @@ server_create(struct config *cfg) {
         goto fail_globals;
     }
 
-    server->data_device_manager = server_data_device_manager_create(server);
-    if (!server->data_device_manager) {
-        goto fail_globals;
+    if (server->backend->data_device_manager) {
+        server->data_device_manager = server_data_device_manager_create(server);
+        if (!server->data_device_manager) {
+            goto fail_globals;
+        }
+    } else {
+        ww_log(LOG_INFO, "wl_data_device_manager not available on host - clipboard/drag disabled");
+        server->data_device_manager = NULL;
     }
     // Allow disabling dmabuf for cross-GPU setups (forces wl_shm fallback)
     if (!cfg->experimental.no_dmabuf) {
@@ -419,8 +424,10 @@ server_get_wl_data_device(struct server *server) {
         return NULL;
     }
 
-    server->backend->seat.data_device = wl_data_device_manager_get_data_device(
-        server->backend->data_device_manager, server->backend->seat.remote);
+    if (server->backend->data_device_manager) {
+        server->backend->seat.data_device = wl_data_device_manager_get_data_device(
+            server->backend->data_device_manager, server->backend->seat.remote);
+    }
     check_alloc(server->backend->seat.data_device);
     return server->backend->seat.data_device;
 }

@@ -20,7 +20,7 @@ struct server_surface_damage {
 struct server_surface_frame {
     struct wl_resource *resource; // wl_callback
     struct wl_list link;
-
+    struct wl_callback *remote;
     struct server_surface *surface;
 };
 
@@ -29,8 +29,24 @@ surface_frame_resource_destroy(struct wl_resource *resource) {
     struct server_surface_frame *frame = wl_resource_get_user_data(resource);
 
     wl_list_remove(&frame->link);
+    if (frame->remote) {
+        wl_callback_destroy(frame->remote);
+        frame->remote = NULL;
+    }
     free(frame);
 }
+
+static void
+on_surface_frame_done(void *data, struct wl_callback *wl, uint32_t callback_data) {
+    struct server_surface_frame *frame = data;
+
+    wl_callback_send_done(frame->resource, callback_data);
+    wl_resource_destroy(frame->resource);
+}
+
+static const struct wl_callback_listener surface_frame_listener = {
+    .done = on_surface_frame_done,
+};
 
 void
 server_surface_send_frame_done(struct server_surface *surface, uint32_t time) {
@@ -251,6 +267,12 @@ surface_frame(struct wl_client *client, struct wl_resource *resource, uint32_t i
 
     frame->surface = surface;
     wl_list_insert(&surface->frame_callbacks, &frame->link);
+
+    // Proxy frame callbacks to the parent compositor so clients are paced by the real display
+    // timing instead of waywall’s internal render loop.
+    frame->remote = wl_surface_frame(surface->remote);
+    check_alloc(frame->remote);
+    wl_callback_add_listener(frame->remote, &surface_frame_listener, frame);
 }
 
 static void

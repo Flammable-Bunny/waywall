@@ -285,6 +285,44 @@ static const struct xdg_surface_listener xdg_surface_listener = {
 };
 
 static void
+on_root_surface_enter(void *data, struct wl_surface *surface, struct wl_output *output) {
+    struct server_ui *ui = data;
+
+    int32_t refresh = server_backend_output_refresh_mhz(ui->server->backend, output);
+    if (refresh <= 0) {
+        return;
+    }
+
+    if (ui->refresh_mhz == refresh) {
+        return;
+    }
+
+    ui->refresh_mhz = refresh;
+    wl_signal_emit_mutable(&ui->events.refresh, NULL);
+    WW_DEBUG(ui.refresh_mhz, ui->refresh_mhz);
+}
+
+static void
+on_root_surface_leave(void *data, struct wl_surface *surface, struct wl_output *output) {
+    struct server_ui *ui = data;
+
+    // Keep the last known refresh if we can't determine a better one.
+    int32_t refresh = server_backend_preferred_refresh_mhz(ui->server->backend);
+    if (refresh <= 0 || ui->refresh_mhz == refresh) {
+        return;
+    }
+
+    ui->refresh_mhz = refresh;
+    wl_signal_emit_mutable(&ui->events.refresh, NULL);
+    WW_DEBUG(ui.refresh_mhz, ui->refresh_mhz);
+}
+
+static const struct wl_surface_listener root_surface_listener = {
+    .enter = on_root_surface_enter,
+    .leave = on_root_surface_leave,
+};
+
+static void
 on_view_surface_commit(struct wl_listener *listener, void *data) {
     struct server_view *view = wl_container_of(listener, view, on_surface_commit);
 
@@ -314,12 +352,14 @@ server_ui_create(struct server *server, struct config *cfg) {
     struct server_ui *ui = zalloc(1, sizeof(*ui));
 
     ui->server = server;
+    ui->refresh_mhz = server_backend_preferred_refresh_mhz(server->backend);
 
     ui->empty_region = wl_compositor_create_region(server->backend->compositor);
     check_alloc(ui->empty_region);
 
     ui->root.surface = wl_compositor_create_surface(server->backend->compositor);
     check_alloc(ui->root.surface);
+    wl_surface_add_listener(ui->root.surface, &root_surface_listener, ui);
 
     ui->root.viewport = wp_viewporter_get_viewport(server->backend->viewporter, ui->root.surface);
     check_alloc(ui->root.viewport);
@@ -366,6 +406,7 @@ server_ui_create(struct server *server, struct config *cfg) {
 
     wl_signal_init(&ui->events.close);
     wl_signal_init(&ui->events.resize);
+    wl_signal_init(&ui->events.refresh);
     wl_signal_init(&ui->events.view_create);
     wl_signal_init(&ui->events.view_destroy);
 
@@ -571,9 +612,13 @@ server_view_commit(struct server_view *view) {
         view->impl->set_size(view->impl_data, view->current.width, view->current.height);
     }
 
-    // Skip subsurface creation when force_composition is enabled (for cross-GPU support).
-    // In this mode, the game is rendered via GL scene composition instead of direct buffer proxy.
-    if (!view->ui->server->force_composition) {
+    // Skip subsurface creation for CENTERED (game) views when force_composition is enabled.
+    // In this mode, the game is rendered via Vulkan scene composition instead of direct buffer proxy.
+    //
+    // However, when WAYWALL_VK_PROXY_GAME=1 is set, we intentionally *do* create a subsurface for
+    // the centered game view so the buffer can be proxied directly to the parent compositor.
+    bool proxy_game = getenv("WAYWALL_VK_PROXY_GAME") != NULL;
+    if (!view->ui->server->force_composition || !view->current.centered || proxy_game) {
         if (visibility_changed && view->current.visible) {
             ww_assert(!view->subsurface);
 
@@ -583,6 +628,11 @@ server_view_commit(struct server_view *view) {
             check_alloc(view->subsurface);
 
             wl_subsurface_set_desync(view->subsurface);
+
+            // Place floating windows above all other subsurfaces (including Vulkan swapchain)
+            if (!view->current.centered) {
+                wl_subsurface_place_above(view->subsurface, view->ui->tree.surface);
+            }
         } else if (visibility_changed && !view->current.visible) {
             ww_assert(view->subsurface);
 

@@ -3,189 +3,87 @@
 
 #include "config/config.h"
 #include "util/box.h"
-#include <GLES2/gl2.h>
-#include <ft2build.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <sys/types.h>
-#include <wayland-server-core.h>
-#include <wayland-util.h>
-#include FT_FREETYPE_H
-#include "server/gl.h"
-
-#define SHADER_SRC_POS_ATTRIB_LOC 0
-#define SHADER_DST_POS_ATTRIB_LOC 1
-#define SHADER_SRC_RGBA_ATTRIB_LOC 2
-#define SHADER_DST_RGBA_ATTRIB_LOC 3
-
-// represents a single character to draw, with color
-struct text_char {
-    uint32_t c;    // utf8 codepoint
-    float rgba[4]; // color
-    int advance;   // only used for custom advance, will be ignored if 0
-};
-
-// single glyph's data
-struct glyph_metadata {
-    int width, height;
-    int bearingX, bearingY;
-    unsigned int advance;
-
-    // atlas position
-    int atlas_x, atlas_y;
-
-    uint32_t character;
-};
-
-struct pending_glyph {
-    uint32_t character;
-    int width, height;
-    int bearingX, bearingY;
-    FT_Pos advance;
-    int atlas_x, atlas_y;
-    unsigned char *bitmap_data;
-    struct pending_glyph *next;
-};
-
-// all glyphs for a given font size in a dynamic atlas
-struct font_size_obj {
-    size_t font_height;
-
-    struct glyph_metadata *glyphs;
-    size_t next_glyph_index; // number of glyphs loaded
-    size_t glyphs_capacity;  // allocated size of chars array
-
-    // atlas
-    bool atlas_initialized;
-    GLuint atlas_tex;
-    int atlas_width;
-    int atlas_height;
-    int atlas_x;
-    int atlas_y;
-    int atlas_row_height;
-
-    struct pending_glyph *pending_head;
-    struct pending_glyph *pending_tail;
-};
-
-struct Custom_atlas {
-    GLuint tex;
-    u_int32_t width;
-};
+#include "server/vk.h"
 
 struct scene {
-    struct server_gl *gl;
+    struct server_vk *vk;
     struct server_ui *ui;
 
     bool force_composition; // Draw capture as background (for cross-GPU support)
     bool vk_active;         // Vulkan backend is handling game rendering (skip game background)
 
-    uint32_t image_max_size;
-
-    struct {
-        struct scene_shader *data;
-        size_t count;
-    } shaders;
-
-    struct {
-        unsigned int debug;
-        size_t debug_vtxcount;
-
-        unsigned int stencil_rect;
-    } buffers;
-
-    struct {
-        int32_t width, height;
-        int32_t tex_width, tex_height;
-        uint32_t equal_frames;
-    } prev_frame;
-
-    struct {
-        struct wl_list sorted; // scene_object.link
-
-        struct wl_list unsorted_images;  // scene_object.link
-        struct wl_list unsorted_mirrors; // scene_object.link
-        struct wl_list unsorted_text;    // scene_object.link
-    } objects;
-
-    int skipped_frames;
-
-    struct wl_listener on_gl_frame;
-
-    struct {
-        FT_Library ft;
-        FT_Face face;
-
-        size_t last_height; // last height set in freetype
-
-        struct font_size_obj *fonts; // array of font sizes
-        size_t fonts_len;
-    } font;
-
-    struct Custom_atlas *atlas_arr;
-    size_t atlas_arr_len;
-
-    struct animation_manager *anim_mgr;
+    struct wl_list objects; // scene_object.link
 };
 
-struct scene_shader {
-    struct server_gl_shader *shader;
-    int shader_u_src_size, shader_u_dst_size;
+enum scene_object_type {
+    SCENE_OBJECT_IMAGE,
+    SCENE_OBJECT_MIRROR,
+    SCENE_OBJECT_TEXT,
+};
 
-    char *name;
+struct scene_object {
+    struct wl_list link; // scene.objects
+    struct scene *parent;
+    enum scene_object_type type;
+
+    // Pointer to underlying Vulkan object (vk_image, vk_mirror, vk_text)
+    void *vk_obj;
+};
+
+struct scene_image {
+    struct scene_object object;
+};
+
+struct scene_mirror {
+    struct scene_object object;
+};
+
+struct scene_text {
+    struct scene_object object;
 };
 
 struct scene_image_options {
     struct box dst;
-
     int32_t depth;
-    char *shader_name;
 };
 
 struct scene_image_from_atlas_options {
     struct box dst;
     struct box src;
-
-    struct Custom_atlas *atlas;
-
+    struct vk_atlas *atlas;
     int32_t depth;
-    char *shader_name;
 };
 
 struct scene_mirror_options {
     struct box src, dst;
     float src_rgba[4];
     float dst_rgba[4];
-
     int32_t depth;
-    char *shader_name;
+    bool color_key_enabled;
+    uint32_t color_key_input;
+    uint32_t color_key_output;
+    float color_key_tolerance;
 };
 
 struct scene_text_options {
     int32_t x;
     int32_t y;
-
     int32_t size;
     int32_t line_spacing;
-
+    uint32_t color; // RGBA
     int32_t depth;
-    char *shader_name;
 };
 
 struct scene_animated_image_options {
     struct box dst;
-
     int32_t depth;
-    char *shader_name;
 };
 
-struct scene_object;
-struct animation;
-struct animation_manager;
-
-struct scene *scene_create(struct config *cfg, struct server_gl *gl, struct server_ui *ui);
+struct scene *scene_create(struct config *cfg, struct server_vk *vk, struct server_ui *ui);
 void scene_destroy(struct scene *scene);
-void scene_set_vk_active(struct scene *scene, bool active);
 
 struct scene_image *scene_add_image(struct scene *scene, const struct scene_image_options *options,
                                     const char *path);
@@ -199,24 +97,27 @@ struct scene_mirror *scene_add_mirror(struct scene *scene,
                                       const struct scene_mirror_options *options);
 struct scene_text *scene_add_text(struct scene *scene, const char *data,
                                   const struct scene_text_options *options);
-struct Custom_atlas *scene_create_atlas(struct scene *scene, const uint32_t width, const char *data,
-                                        size_t len);
-void scene_atlas_raw_image(struct scene *scene, struct Custom_atlas *atlas, const char *data,
-                           size_t data_len, u_int32_t x, uint32_t y);
-void scene_atlas_destroy(struct Custom_atlas *atlas);
-char *atlas_get_dump(struct scene *scene, struct Custom_atlas *atlas, size_t *out_len);
+
+struct vk_atlas *scene_create_atlas(struct scene *scene, uint32_t width, const char *data, size_t len);
+void scene_atlas_destroy(struct vk_atlas *atlas);
+void scene_atlas_raw_image(struct scene *scene, struct vk_atlas *atlas, const char *data,
+                           size_t data_len, uint32_t x, uint32_t y);
+char *atlas_get_dump(struct scene *scene, struct vk_atlas *atlas, size_t *out_len);
+
 void scene_object_destroy(struct scene_object *object);
 int32_t scene_object_get_depth(struct scene_object *object);
 void scene_object_set_depth(struct scene_object *object, int32_t depth);
 void scene_object_hide(struct scene_object *object);
 void scene_object_show(struct scene_object *object);
 
+
 struct advance_ret {
     int32_t x;
     int32_t y;
 };
 
-struct advance_ret text_get_advance(struct scene *scene, const char *data, const size_t data_len,
-                                    const u_int32_t size);
+struct advance_ret text_get_advance(struct scene *scene, const char *data, const size_t data_len, const uint32_t size);
+
+void scene_set_vk_active(struct scene *scene, bool active);
 
 #endif

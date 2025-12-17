@@ -13,6 +13,7 @@
 #include "xdg-decoration-unstable-v1-client-protocol.h"
 #include "xdg-shell-client-protocol.h"
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <wayland-client-core.h>
@@ -34,10 +35,65 @@
 #define USE_VIEWPORTER_VERSION 1
 #define USE_XDG_DECORATION_VERSION 1
 #define USE_XDG_WM_BASE_VERSION 1
+#define USE_WL_OUTPUT_VERSION 4
 
 struct seat_name {
     struct wl_list link; // server_backend.seat.names
     uint32_t name;
+};
+
+static void
+on_output_geometry(void *data, struct wl_output *wl, int32_t x, int32_t y, int32_t physical_width,
+                   int32_t physical_height, int32_t subpixel, const char *make, const char *model,
+                   int32_t transform) {
+    // Unused.
+}
+
+static void
+on_output_mode(void *data, struct wl_output *wl, uint32_t flags, int32_t width, int32_t height,
+               int32_t refresh) {
+    struct server_backend_output *output = data;
+
+    if (!(flags & WL_OUTPUT_MODE_CURRENT)) {
+        return;
+    }
+
+    output->width = width;
+    output->height = height;
+    output->refresh_mhz = refresh;
+
+    if (refresh > output->backend->preferred_refresh_mhz) {
+        output->backend->preferred_refresh_mhz = refresh;
+    }
+}
+
+static void
+on_output_done(void *data, struct wl_output *wl) {
+    // Unused.
+}
+
+static void
+on_output_scale(void *data, struct wl_output *wl, int32_t factor) {
+    // Unused.
+}
+
+static void
+on_output_name(void *data, struct wl_output *wl, const char *name) {
+    // Unused.
+}
+
+static void
+on_output_description(void *data, struct wl_output *wl, const char *description) {
+    // Unused.
+}
+
+static const struct wl_output_listener output_listener = {
+    .geometry = on_output_geometry,
+    .mode = on_output_mode,
+    .done = on_output_done,
+    .scale = on_output_scale,
+    .name = on_output_name,
+    .description = on_output_description,
 };
 
 static void
@@ -139,14 +195,20 @@ on_registry_global(void *data, struct wl_registry *wl, uint32_t name, const char
             wl, name, &wp_cursor_shape_manager_v1_interface, USE_CURSOR_SHAPE_VERSION);
         check_alloc(backend->cursor_shape_manager);
     } else if (strcmp(iface, wl_data_device_manager_interface.name) == 0) {
-        if (version < USE_DATA_DEVICE_MANAGER_VERSION) {
-            ww_log(LOG_ERROR, "host compostior provides outdated wl_data_device_manager (%d < %d)",
-                   version, USE_DATA_DEVICE_MANAGER_VERSION);
+        // Make data_device_manager optional; accept older versions if present.
+        uint32_t use_version = version < USE_DATA_DEVICE_MANAGER_VERSION ? version : USE_DATA_DEVICE_MANAGER_VERSION;
+        if (use_version == 0) {
+            ww_log(LOG_WARN, "host compositor reports wl_data_device_manager version 0, skipping bind");
             return;
         }
 
-        backend->data_device_manager = wl_registry_bind(wl, name, &wl_data_device_manager_interface,
-                                                        USE_DATA_DEVICE_MANAGER_VERSION);
+        if (version < USE_DATA_DEVICE_MANAGER_VERSION) {
+            ww_log(LOG_WARN, "host compositor provides wl_data_device_manager v%u (< %u) - clipboard/drag may be limited",
+                   version, USE_DATA_DEVICE_MANAGER_VERSION);
+        }
+
+        backend->data_device_manager =
+            wl_registry_bind(wl, name, &wl_data_device_manager_interface, use_version);
         check_alloc(backend->data_device_manager);
     } else if (strcmp(iface, zwp_linux_dmabuf_v1_interface.name) == 0) {
         if (version < USE_LINUX_DMABUF_VERSION) {
@@ -289,12 +351,44 @@ on_registry_global(void *data, struct wl_registry *wl, uint32_t name, const char
         check_alloc(backend->xdg_wm_base);
 
         xdg_wm_base_add_listener(backend->xdg_wm_base, &xdg_wm_base_listener, backend);
+    } else if (strcmp(iface, wl_output_interface.name) == 0) {
+        uint32_t use_version = version < USE_WL_OUTPUT_VERSION ? version : USE_WL_OUTPUT_VERSION;
+        if (use_version < 1) {
+            return;
+        }
+
+        struct server_backend_output *output = zalloc(1, sizeof(*output));
+        check_alloc(output);
+
+        output->backend = backend;
+        output->name = name;
+        output->refresh_mhz = 0;
+
+        output->remote = wl_registry_bind(wl, name, &wl_output_interface, use_version);
+        check_alloc(output->remote);
+        wl_output_add_listener(output->remote, &output_listener, output);
+
+        wl_list_insert(&backend->outputs, &output->link);
     }
 }
 
 static void
 on_registry_global_remove(void *data, struct wl_registry *wl, uint32_t name) {
-    // TODO: ???
+    struct server_backend *backend = data;
+
+    struct server_backend_output *output, *tmp;
+    wl_list_for_each_safe (output, tmp, &backend->outputs, link) {
+        if (output->name != name) {
+            continue;
+        }
+
+        wl_list_remove(&output->link);
+        if (output->remote) {
+            wl_output_release(output->remote);
+        }
+        free(output);
+        return;
+    }
 }
 
 static const struct wl_registry_listener registry_listener = {
@@ -307,7 +401,9 @@ server_backend_create() {
     struct server_backend *backend = zalloc(1, sizeof(*backend));
 
     wl_list_init(&backend->seat.names);
+    wl_list_init(&backend->outputs);
     wl_array_init(&backend->shm_formats);
+    backend->preferred_refresh_mhz = 60000;
 
     wl_signal_init(&backend->events.seat_data_device);
     wl_signal_init(&backend->events.seat_keyboard);
@@ -327,10 +423,6 @@ server_backend_create() {
 
     if (!backend->compositor) {
         ww_log(LOG_ERROR, "host compositor does not provide wl_compositor");
-        goto fail_registry;
-    }
-    if (!backend->data_device_manager) {
-        ww_log(LOG_ERROR, "host compositor does not provide wl_data_device_manager");
         goto fail_registry;
     }
     if (!backend->linux_dmabuf) {
@@ -385,6 +477,30 @@ fail_display:
     return NULL;
 }
 
+int32_t
+server_backend_preferred_refresh_mhz(struct server_backend *backend) {
+    if (!backend) {
+        return 0;
+    }
+    return backend->preferred_refresh_mhz;
+}
+
+int32_t
+server_backend_output_refresh_mhz(struct server_backend *backend, struct wl_output *output) {
+    if (!backend || !output) {
+        return 0;
+    }
+
+    struct server_backend_output *iter;
+    wl_list_for_each(iter, &backend->outputs, link) {
+        if (iter->remote == output) {
+            return iter->refresh_mhz;
+        }
+    }
+
+    return 0;
+}
+
 void
 server_backend_destroy(struct server_backend *backend) {
     struct seat_name *name, *tmp;
@@ -394,6 +510,15 @@ server_backend_destroy(struct server_backend *backend) {
     }
 
     wl_array_release(&backend->shm_formats);
+
+    struct server_backend_output *output, *tmp_output;
+    wl_list_for_each_safe (output, tmp_output, &backend->outputs, link) {
+        wl_list_remove(&output->link);
+        if (output->remote) {
+            wl_output_release(output->remote);
+        }
+        free(output);
+    }
 
     if (backend->seat.remote) {
         if (backend->seat.data_device) {

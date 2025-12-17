@@ -15,5 +15,7 @@ void main() {
     float alpha = texture(u_texture, f_src_pos).r;  // Font atlas uses R channel
     if (alpha < 0.01)
         discard;
-    out_color = vec4(f_dst_rgba.rgb, f_dst_rgba.a * alpha);
+    // Output pre-multiplied alpha for correct compositing
+    float final_alpha = f_dst_rgba.a * alpha;
+    out_color = vec4(f_dst_rgba.rgb * final_alpha, final_alpha);
 }

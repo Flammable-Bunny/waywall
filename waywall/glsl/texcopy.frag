@@ -12,8 +12,7 @@ void main() {
     vec4 color = texture2D(u_texture, f_src_pos);
 
     // DIRECT RENDER DEBUG: Bypass all logic and show the texture
-    gl_FragColor = color;
-    // gl_FragColor = vec4(color.r, color.g, color.b, 1.0); // Force alpha to 1.0 if needed
+    gl_FragColor = vec4(color.r, color.g, color.b, 1.0); // Force alpha to 1.0 to ensure visibility
 
     /*
     // Swap Red and Blue channels for cross-GPU compatibility

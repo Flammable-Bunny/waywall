@@ -55,12 +55,14 @@ void main() {
         float db = abs(b - pc.key_b);
 
         if (dr <= pc.tolerance && dg <= pc.tolerance && db <= pc.tolerance) {
-            // Replace with output color
-            r = pc.out_r;
-            g = pc.out_g;
-            b = pc.out_b;
+            // Matched -> render with output color (opaque)
+            out_color = vec4(pc.out_r, pc.out_g, pc.out_b, 1.0);
+        } else {
+            // Not matched -> transparent (don't render)
+            out_color = vec4(0.0, 0.0, 0.0, 0.0);
         }
+    } else {
+        // No color keying -> render as-is
+        out_color = vec4(r, g, b, 1.0);
     }
-
-    out_color = vec4(r, g, b, 1.0);
 }

@@ -87,6 +87,7 @@ static const struct {
 #define METATABLE_IRC "waywall.irc"
 #define METATABLE_HTTP "waywall.http"
 #define METATABLE_ATLAS "waywall.atlas"
+#define METATABLE_VK_ATLAS "waywall.vk_atlas"
 
 #define STARTUP_ERRMSG(function) function " cannot be called during startup"
 
@@ -460,6 +461,89 @@ vk_text_gc(lua_State *L) {
 }
 
 static int
+vk_atlas_close(lua_State *L) {
+    struct vk_atlas **atlas = lua_touserdata(L, 1);
+    if (!*atlas) {
+        return luaL_error(L, "cannot close atlas more than once");
+    }
+
+    struct config_vm *vm = config_vm_from(L);
+    struct wrap *wrap = config_vm_get_wrap(vm);
+    if (wrap && wrap->vk) {
+        server_vk_atlas_unref(*atlas);
+    }
+    *atlas = NULL;
+    return 0;
+}
+
+static int
+vk_atlas_raw(lua_State *L) {
+    struct vk_atlas **atlas = lua_touserdata(L, 1);
+    if (!atlas || !*atlas) {
+        return luaL_error(L, "invalid atlas");
+    }
+
+    size_t data_size = 0;
+    const char *data = luaL_checklstring(L, 2, &data_size);
+    const int x = luaL_checkinteger(L, 3);
+    const int y = luaL_checkinteger(L, 4);
+
+    if (!server_vk_atlas_insert_raw(*atlas, data, data_size, (uint32_t)x, (uint32_t)y)) {
+        return 0;
+    }
+    return 0;
+}
+
+static int
+vk_atlas_get_raw(lua_State *L) {
+    struct vk_atlas **atlas = lua_touserdata(L, 1);
+    if (!atlas || !*atlas) {
+        return luaL_error(L, "invalid atlas");
+    }
+
+    size_t out_len = 0;
+    char *dump = server_vk_atlas_get_dump(*atlas, &out_len);
+    if (!dump) {
+        lua_pushnil(L);
+        return 1;
+    }
+
+    lua_pushlstring(L, dump, out_len);
+    free(dump);
+    return 1;
+}
+
+static int
+vk_atlas_index(lua_State *L) {
+    const char *key = luaL_checkstring(L, 2);
+
+    if (strcmp(key, "close") == 0) {
+        lua_pushcfunction(L, vk_atlas_close);
+    } else if (strcmp(key, "insert_raw") == 0) {
+        lua_pushcfunction(L, vk_atlas_raw);
+    } else if (strcmp(key, "get_dump") == 0) {
+        lua_pushcfunction(L, vk_atlas_get_raw);
+    } else {
+        lua_pushnil(L);
+    }
+    return 1;
+}
+
+static int
+vk_atlas_gc(lua_State *L) {
+    struct vk_atlas **atlas = lua_touserdata(L, 1);
+    if (*atlas) {
+        struct config_vm *vm = config_vm_from(L);
+        struct wrap *wrap = config_vm_get_wrap(vm);
+        if (wrap && wrap->vk) {
+            server_vk_atlas_unref(*atlas);
+        }
+    }
+    *atlas = NULL;
+    return 0;
+}
+
+static int
 mirror_close(lua_State *L) {
     struct scene_mirror **mirror = lua_touserdata(L, 1);
 
@@ -685,7 +769,7 @@ http_client_gc(lua_State *L) {
 
 static int
 atlas_close_(lua_State *L) {
-    struct Custom_atlas **atlas = lua_touserdata(L, 1);
+    struct vk_atlas **atlas = lua_touserdata(L, 1);
 
     if (!*atlas) {
         return luaL_error(L, "cannot close atlas more than once");
@@ -703,7 +787,7 @@ atlas_raw(lua_State *L) {
     struct config_vm *vm = config_vm_from(L);
     struct wrap *wrap = config_vm_get_wrap(vm);
     CHECK_SCENE(wrap, L);
-    struct Custom_atlas **atlas = lua_touserdata(L, 1);
+    struct vk_atlas **atlas = lua_touserdata(L, 1);
 
     size_t data_size;
     const char *data = luaL_checklstring(L, 2, &data_size);
@@ -722,7 +806,7 @@ atlas_get_raw(lua_State *L) {
     struct config_vm *vm = config_vm_from(L);
     struct wrap *wrap = config_vm_get_wrap(vm);
     CHECK_SCENE(wrap, L);
-    struct Custom_atlas **atlas = lua_touserdata(L, 1);
+    struct vk_atlas **atlas = lua_touserdata(L, 1);
 
     size_t data_size;
     char *data = atlas_get_dump(wrap->scene, *atlas, &data_size);
@@ -754,7 +838,7 @@ atlas_index(lua_State *L) {
 
 static int
 atlas_gc(lua_State *L) {
-    struct Custom_atlas **atlas = lua_touserdata(L, 1);
+    struct vk_atlas **atlas = lua_touserdata(L, 1);
 
     if (*atlas) {
         scene_atlas_destroy(*atlas);
@@ -981,6 +1065,15 @@ l_image(lua_State *L) {
         struct vk_image_options vk_options = {0};
         unmarshal_box_key(L, "dst", &vk_options.dst);
 
+        lua_pushstring(L, "depth");
+        lua_rawget(L, ARG_OPTIONS);
+        if (lua_type(L, -1) == LUA_TNUMBER) {
+            vk_options.depth = lua_tointeger(L, -1);
+        } else {
+            vk_options.depth = DEFAULT_DEPTH;
+        }
+        lua_pop(L, 1);
+
         // Body - create Vulkan image
         struct vk_image **image = lua_newuserdata(L, sizeof(*image));
         check_alloc(image);
@@ -1008,7 +1101,7 @@ l_image(lua_State *L) {
     lua_pushstring(L, "shader");
     lua_rawget(L, ARG_OPTIONS);
     if (lua_type(L, -1) == LUA_TSTRING) {
-        options.shader_name = strdup(lua_tostring(L, -1));
+        // options.shader_name = strdup(lua_tostring(L, -1));
     }
     lua_pop(L, 1);
 
@@ -1029,7 +1122,7 @@ l_image(lua_State *L) {
     lua_setmetatable(L, -2);
 
     *image = scene_add_image(wrap->scene, &options, path);
-    free(options.shader_name);
+    // free(options.shader_name);
     if (!*image) {
         return luaL_error(L, "failed to create image from PNG at '%s'", path);
     }
@@ -1048,9 +1141,47 @@ l_image_from_atlas(lua_State *L) {
     if (!wrap) {
         return luaL_error(L, STARTUP_ERRMSG("image"));
     }
-    // In Vulkan-only mode, images aren't supported yet - return nil instead of erroring
+    // In Vulkan-only mode, use a Vulkan atlas + image.
     if (!wrap->scene) {
-        lua_pushnil(L);
+        if (!wrap->vk) {
+            lua_pushnil(L);
+            return 1;
+        }
+
+        struct vk_image_options vk_options = {0};
+        struct box src = {0};
+        unmarshal_box_key(L, "dst", &vk_options.dst);
+        unmarshal_box_key(L, "src", &src);
+
+        lua_pushstring(L, "depth");
+        lua_rawget(L, ARG_OPTIONS);
+        if (lua_type(L, -1) == LUA_TNUMBER) {
+            vk_options.depth = lua_tointeger(L, -1);
+        } else {
+            vk_options.depth = DEFAULT_DEPTH;
+        }
+        lua_pop(L, 1);
+
+        lua_pushstring(L, "atlas");
+        lua_rawget(L, ARG_OPTIONS);
+        struct vk_atlas **atlas_ptr = lua_touserdata(L, -1);
+        if (!atlas_ptr || !*atlas_ptr) {
+            lua_pop(L, 1);
+            lua_pushnil(L);
+            return 1;
+        }
+        struct vk_atlas *atlas = *atlas_ptr;
+        lua_pop(L, 1);
+
+        struct vk_image **image = lua_newuserdata(L, sizeof(*image));
+        check_alloc(image);
+        luaL_getmetatable(L, METATABLE_VK_IMAGE);
+        lua_setmetatable(L, -2);
+
+        *image = server_vk_add_image_from_atlas(wrap->vk, atlas, src, &vk_options);
+        if (!*image) {
+            return luaL_error(L, "failed to create Vulkan atlas image");
+        }
         return 1;
     }
 
@@ -1061,7 +1192,7 @@ l_image_from_atlas(lua_State *L) {
     lua_pushstring(L, "shader");
     lua_rawget(L, ARG_OPTIONS);
     if (lua_type(L, -1) == LUA_TSTRING) {
-        options.shader_name = strdup(lua_tostring(L, -1));
+        // options.shader_name = strdup(lua_tostring(L, -1));
     }
     lua_pop(L, 1);
 
@@ -1076,7 +1207,7 @@ l_image_from_atlas(lua_State *L) {
 
     lua_pushstring(L, "atlas");
     lua_rawget(L, ARG_OPTIONS);
-    struct Custom_atlas **atlas_ptr = lua_touserdata(L, -1);
+    struct vk_atlas **atlas_ptr = lua_touserdata(L, -1);
     if (!atlas_ptr || !*atlas_ptr) {
         return luaL_error(L, "invalid atlas");
     }
@@ -1090,7 +1221,7 @@ l_image_from_atlas(lua_State *L) {
     lua_setmetatable(L, -2);
 
     *image = scene_add_image_from_atlas(wrap->scene, &options);
-    free(options.shader_name);
+    // free(options.shader_name);
     if (!*image) {
         return luaL_error(L, "failed to create image");
     }
@@ -1110,9 +1241,38 @@ l_animated_image(lua_State *L) {
     if (!wrap) {
         return luaL_error(L, STARTUP_ERRMSG("animated_image"));
     }
-    // In Vulkan-only mode, animated images aren't supported yet - return nil
+    // In Vulkan-only mode, create a Vulkan image from the AVIF (first frame).
     if (!wrap->scene) {
-        lua_pushnil(L);
+        if (!wrap->vk) {
+            lua_pushnil(L);
+            return 1;
+        }
+
+        const char *path = luaL_checkstring(L, ARG_PATH);
+        luaL_checktype(L, ARG_OPTIONS, LUA_TTABLE);
+        lua_settop(L, ARG_OPTIONS);
+
+        struct vk_image_options vk_options = {0};
+        unmarshal_box_key(L, "dst", &vk_options.dst);
+
+        lua_pushstring(L, "depth");
+        lua_rawget(L, ARG_OPTIONS);
+        if (lua_type(L, -1) == LUA_TNUMBER) {
+            vk_options.depth = lua_tointeger(L, -1);
+        } else {
+            vk_options.depth = DEFAULT_DEPTH;
+        }
+        lua_pop(L, 1);
+
+        struct vk_image **image = lua_newuserdata(L, sizeof(*image));
+        check_alloc(image);
+        luaL_getmetatable(L, METATABLE_VK_IMAGE);
+        lua_setmetatable(L, -2);
+
+        *image = server_vk_add_avif_image(wrap->vk, path, &vk_options);
+        if (!*image) {
+            return luaL_error(L, "failed to create Vulkan animated image from AVIF at '%s'", path);
+        }
         return 1;
     }
 
@@ -1126,7 +1286,7 @@ l_animated_image(lua_State *L) {
     lua_pushstring(L, "shader");
     lua_rawget(L, ARG_OPTIONS);
     if (lua_type(L, -1) == LUA_TSTRING) {
-        options.shader_name = strdup(lua_tostring(L, -1));
+        // options.shader_name = strdup(lua_tostring(L, -1));
     }
     lua_pop(L, 1);
 
@@ -1147,7 +1307,7 @@ l_animated_image(lua_State *L) {
     lua_setmetatable(L, -2);
 
     *image = scene_add_animated_image(wrap->scene, &options, path);
-    free(options.shader_name);
+    // free(options.shader_name);
     if (!*image) {
         return luaL_error(L, "failed to create animated image from AVIF at '%s'", path);
     }
@@ -1176,6 +1336,15 @@ l_mirror(lua_State *L) {
 
         unmarshal_box_key(L, "src", &options.src);
         unmarshal_box_key(L, "dst", &options.dst);
+
+        lua_pushstring(L, "depth");
+        lua_rawget(L, ARG_OPTIONS);
+        if (lua_type(L, -1) == LUA_TNUMBER) {
+            options.depth = lua_tointeger(L, -1);
+        } else {
+            options.depth = DEFAULT_DEPTH;
+        }
+        lua_pop(L, 1);
 
         lua_pushstring(L, "color_key"); // stack: 2
         lua_rawget(L, ARG_OPTIONS);     // stack: 2
@@ -1224,7 +1393,7 @@ l_mirror(lua_State *L) {
     lua_pushstring(L, "shader");
     lua_rawget(L, ARG_OPTIONS);
     if (lua_type(L, -1) == LUA_TSTRING) {
-        options.shader_name = strdup(lua_tostring(L, -1));
+        // options.shader_name = strdup(lua_tostring(L, -1));
     }
     lua_pop(L, 1);
 
@@ -1254,7 +1423,7 @@ l_mirror(lua_State *L) {
     lua_setmetatable(L, -2);
 
     *mirror = scene_add_mirror(wrap->scene, &options);
-    free(options.shader_name);
+    // free(options.shader_name);
     if (!*mirror) {
         return luaL_error(L, "failed to create mirror");
     }
@@ -1734,6 +1903,24 @@ l_text(lua_State *L) {
         }
         lua_pop(L, 1);
 
+        lua_pushstring(L, "ls");
+        lua_rawget(L, ARG_OPTIONS);
+        if (lua_type(L, -1) == LUA_TNUMBER) {
+            vk_options.line_spacing = lua_tointeger(L, -1);
+        } else {
+            vk_options.line_spacing = 0;
+        }
+        lua_pop(L, 1);
+
+        lua_pushstring(L, "depth");
+        lua_rawget(L, ARG_OPTIONS);
+        if (lua_type(L, -1) == LUA_TNUMBER) {
+            vk_options.depth = lua_tointeger(L, -1);
+        } else {
+            vk_options.depth = DEFAULT_DEPTH;
+        }
+        lua_pop(L, 1);
+
         // Body - create Vulkan text
         struct vk_text **text = lua_newuserdata(L, sizeof(*text));
         check_alloc(text);
@@ -1790,7 +1977,7 @@ l_text(lua_State *L) {
     lua_pushstring(L, "shader");
     lua_rawget(L, ARG_OPTIONS);
     if (lua_type(L, -1) == LUA_TSTRING) {
-        options.shader_name = strdup(lua_tostring(L, -1));
+        // options.shader_name = strdup(lua_tostring(L, -1));
     }
     lua_pop(L, 1);
 
@@ -1820,7 +2007,7 @@ l_text(lua_State *L) {
     lua_setmetatable(L, -2);
 
     *text = scene_add_text(wrap->scene, data, &options);
-    free(options.shader_name);
+    // free(options.shader_name);
     if (!*text) {
         return luaL_error(L, "failed to create text");
     }
@@ -1840,12 +2027,21 @@ l_text_advance(lua_State *L) {
     if (!wrap) {
         return luaL_error(L, STARTUP_ERRMSG("text"));
     }
-    // In Vulkan-only mode, text_advance isn't supported yet - return {x=0, y=0}
+    // In Vulkan-only mode, use the Vulkan font system for advance computation.
     if (!wrap->scene) {
+        size_t data_size = 0;
+        const char *data = luaL_checklstring(L, ARG_TEXT, &data_size);
+        const uint32_t size = (uint32_t)luaL_checkinteger(L, ARG_SIZE);
+
+        struct vk_advance_ret adv = {0};
+        if (wrap->vk) {
+            adv = server_vk_text_advance(wrap->vk, data, data_size, size);
+        }
+
         lua_newtable(L);
-        lua_pushinteger(L, 0);
+        lua_pushinteger(L, adv.x);
         lua_setfield(L, -2, "x");
-        lua_pushinteger(L, 0);
+        lua_pushinteger(L, adv.y);
         lua_setfield(L, -2, "y");
         return 1;
     }
@@ -2026,9 +2222,52 @@ l_atlas(lua_State *L) {
     if (!wrap) {
         return luaL_error(L, STARTUP_ERRMSG("atlas"));
     }
-    // In Vulkan-only mode, atlas isn't supported yet - return nil
+    // In Vulkan-only mode, create a Vulkan-backed atlas (raw RGBA).
     if (!wrap->scene) {
-        lua_pushnil(L);
+        const int width = luaL_checkinteger(L, ARG_WIDTH);
+
+        const char *data = NULL;
+        size_t len = 0;
+        if (lua_gettop(L) >= ARG_DATA && !lua_isnil(L, ARG_DATA)) {
+            data = luaL_checklstring(L, ARG_DATA, &len);
+        }
+
+        struct vk_atlas **atlas = lua_newuserdata(L, sizeof(*atlas));
+        check_alloc(atlas);
+        luaL_getmetatable(L, METATABLE_VK_ATLAS);
+        lua_setmetatable(L, -2);
+
+        if (!wrap->vk) {
+            *atlas = NULL;
+            return 1;
+        }
+
+        // If no dump is provided, create an empty square atlas (used by fetch_emotes.lua).
+        const char *atlas_data = data;
+        size_t atlas_len = len;
+        char *blank = NULL;
+        if (!atlas_data) {
+            if (width <= 0) {
+                *atlas = NULL;
+                return 1;
+            }
+            size_t w = (size_t)width;
+            if (w > 0 && w > (SIZE_MAX / 4) / w) {
+                *atlas = NULL;
+                return luaL_error(L, "atlas size overflow");
+            }
+            atlas_len = w * w * 4;
+            blank = calloc(1, atlas_len);
+            check_alloc(blank);
+            atlas_data = blank;
+        }
+
+        *atlas = server_vk_create_atlas(wrap->vk, (uint32_t)width, atlas_data, atlas_len);
+        free(blank);
+        if (!*atlas) {
+            return luaL_error(L, "failed to init Vulkan atlas");
+        }
+
         return 1;
     }
 
@@ -2042,7 +2281,7 @@ l_atlas(lua_State *L) {
     }
 
     // Body
-    struct Custom_atlas **atlas = lua_newuserdata(L, sizeof(*atlas));
+    struct vk_atlas **atlas = lua_newuserdata(L, sizeof(*atlas));
     check_alloc(atlas);
     luaL_getmetatable(L, METATABLE_ATLAS);
     lua_setmetatable(L, -2);
@@ -2131,6 +2370,26 @@ config_api_init(struct config_vm *vm) {
     lua_settable(vm->L, -3);                       // stack: n+1
     lua_pushstring(vm->L, "__index");              // stack: n+2
     lua_pushcfunction(vm->L, vk_image_index);      // stack: n+3
+    lua_settable(vm->L, -3);                       // stack: n+1
+    lua_pop(vm->L, 1);                             // stack: n
+
+    // Create the metatable for Vulkan "text" objects.
+    luaL_newmetatable(vm->L, METATABLE_VK_TEXT);   // stack: n+1
+    lua_pushstring(vm->L, "__gc");                 // stack: n+2
+    lua_pushcfunction(vm->L, vk_text_gc);          // stack: n+3
+    lua_settable(vm->L, -3);                       // stack: n+1
+    lua_pushstring(vm->L, "__index");              // stack: n+2
+    lua_pushcfunction(vm->L, vk_text_index);       // stack: n+3
+    lua_settable(vm->L, -3);                       // stack: n+1
+    lua_pop(vm->L, 1);                             // stack: n
+
+    // Create the metatable for Vulkan "atlas" objects.
+    luaL_newmetatable(vm->L, METATABLE_VK_ATLAS);  // stack: n+1
+    lua_pushstring(vm->L, "__gc");                 // stack: n+2
+    lua_pushcfunction(vm->L, vk_atlas_gc);         // stack: n+3
+    lua_settable(vm->L, -3);                       // stack: n+1
+    lua_pushstring(vm->L, "__index");              // stack: n+2
+    lua_pushcfunction(vm->L, vk_atlas_index);      // stack: n+3
     lua_settable(vm->L, -3);                       // stack: n+1
     lua_pop(vm->L, 1);                             // stack: n
 

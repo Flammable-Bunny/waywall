@@ -6,6 +6,8 @@
 #include <wayland-server-core.h>
 #include <wayland-util.h>
 
+struct server_drm_syncobj_surface;
+
 struct server_compositor {
     struct wl_global *global;
 
@@ -31,6 +33,7 @@ struct server_surface {
 
     struct server_compositor *parent;
     struct wl_surface *remote;
+    struct server_drm_syncobj_surface *syncobj;
 
     struct server_surface_state {
         struct server_buffer *buffer;

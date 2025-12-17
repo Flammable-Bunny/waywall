@@ -3,10 +3,10 @@
 #include "util/alloc.h"
 #include "util/log.h"
 #include "util/prelude.h"
-#include <luajit-2.1/lauxlib.h>
-#include <luajit-2.1/lua.h>
-#include <luajit-2.1/luajit.h>
-#include <luajit-2.1/lualib.h>
+#include <lauxlib.h>
+#include <lua.h>
+#include <luajit.h>
+#include <lualib.h>
 #include <wayland-util.h>
 
 struct config_vm_waker {

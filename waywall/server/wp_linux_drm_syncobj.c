@@ -36,12 +36,19 @@ on_surface_destroy(struct wl_listener *listener, void *data) {
     struct server_drm_syncobj_surface *syncobj_surface =
         wl_container_of(listener, syncobj_surface, on_surface_destroy);
 
-    syncobj_surface->parent = NULL;
+    if (syncobj_surface->parent) {
+        syncobj_surface->parent->syncobj = NULL;
+        syncobj_surface->parent = NULL;
+    }
 }
 
 static void
 drm_syncobj_surface_resource_destroy(struct wl_resource *resource) {
     struct server_drm_syncobj_surface *syncobj_surface = wl_resource_get_user_data(resource);
+
+    if (syncobj_surface->parent) {
+        syncobj_surface->parent->syncobj = NULL;
+    }
 
     if (syncobj_surface->acquire.fd != -1) {
         close(syncobj_surface->acquire.fd);
@@ -80,14 +87,18 @@ drm_syncobj_surface_set_acquire_point(struct wl_client *client, struct wl_resour
     struct server_drm_syncobj_timeline *syncobj_timeline =
         wl_resource_get_user_data(timeline_resource);
 
-    if (syncobj_surface->acquire.fd != -1) {
-        close(syncobj_surface->acquire.fd);
-    }
+    if (syncobj_surface->acquire.fd == -1 ||
+        syncobj_surface->acquire.timeline_fd != syncobj_timeline->fd) {
+        if (syncobj_surface->acquire.fd != -1) {
+            close(syncobj_surface->acquire.fd);
+        }
 
-    syncobj_surface->acquire.fd = dup(syncobj_timeline->fd);
-    if (syncobj_surface->acquire.fd == -1) {
-        wl_client_post_implementation_error(client, "failed to dup timeline acquire point fd");
-        return;
+        syncobj_surface->acquire.fd = dup(syncobj_timeline->fd);
+        if (syncobj_surface->acquire.fd == -1) {
+            wl_client_post_implementation_error(client, "failed to dup timeline acquire point fd");
+            return;
+        }
+        syncobj_surface->acquire.timeline_fd = syncobj_timeline->fd;
     }
 
     syncobj_surface->acquire.point_hi = point_hi;
@@ -113,14 +124,18 @@ drm_syncobj_surface_set_release_point(struct wl_client *client, struct wl_resour
     struct server_drm_syncobj_timeline *syncobj_timeline =
         wl_resource_get_user_data(timeline_resource);
 
-    if (syncobj_surface->release.fd != -1) {
-        close(syncobj_surface->release.fd);
-    }
+    if (syncobj_surface->release.fd == -1 ||
+        syncobj_surface->release.timeline_fd != syncobj_timeline->fd) {
+        if (syncobj_surface->release.fd != -1) {
+            close(syncobj_surface->release.fd);
+        }
 
-    syncobj_surface->release.fd = dup(syncobj_timeline->fd);
-    if (syncobj_surface->release.fd == -1) {
-        wl_client_post_implementation_error(client, "failed to dup timeline release point fd");
-        return;
+        syncobj_surface->release.fd = dup(syncobj_timeline->fd);
+        if (syncobj_surface->release.fd == -1) {
+            wl_client_post_implementation_error(client, "failed to dup timeline release point fd");
+            return;
+        }
+        syncobj_surface->release.timeline_fd = syncobj_timeline->fd;
     }
 
     syncobj_surface->release.point_hi = point_hi;
@@ -194,6 +209,10 @@ drm_syncobj_manager_get_surface(struct wl_client *client, struct wl_resource *re
 
     syncobj_surface->acquire.fd = -1;
     syncobj_surface->release.fd = -1;
+    syncobj_surface->acquire.timeline_fd = -1;
+    syncobj_surface->release.timeline_fd = -1;
+
+    surface->syncobj = syncobj_surface;
 
     syncobj_surface->on_surface_destroy.notify = on_surface_destroy;
     wl_signal_add(&surface->events.destroy, &syncobj_surface->on_surface_destroy);

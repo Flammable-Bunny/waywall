@@ -62,6 +62,11 @@ struct server_gl {
 
     int drm_fd;
     struct gbm_device *gbm;
+
+    // Whether tearing is allowed (swap interval 0) or vsync (swap interval 1)
+    bool tearing;
+    // Force CPU copy path for cross-GPU buffers (avoids driver implicit sync issues)
+    bool force_cpu_copy;
 };
 
 struct server_gl_shader {
@@ -79,6 +84,8 @@ struct server_gl_shader *server_gl_compile(struct server_gl *gl, const char *ver
 GLuint server_gl_get_capture(struct server_gl *gl);
 void server_gl_get_capture_size(struct server_gl *gl, int32_t *width, int32_t *height);
 void server_gl_set_capture(struct server_gl *gl, struct server_surface *surface);
+void server_gl_set_tearing(struct server_gl *gl, bool tearing);
+void server_gl_set_force_cpu_copy(struct server_gl *gl, bool force_cpu_copy);
 void server_gl_swap_buffers(struct server_gl *gl);
 
 void server_gl_shader_destroy(struct server_gl_shader *shader);

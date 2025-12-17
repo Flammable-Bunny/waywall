@@ -18,6 +18,8 @@ struct server_linux_dmabuf {
     struct wl_event_queue *queue;       // queue for proxy wrappers
 
     struct wl_listener on_display_destroy;
+
+    bool allow_modifiers;
 };
 
 struct server_linux_buffer_params {

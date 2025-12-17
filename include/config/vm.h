@@ -1,8 +1,8 @@
 #ifndef WAYWALL_CONFIG_VM_H
 #define WAYWALL_CONFIG_VM_H
 
-#include <luajit-2.1/lauxlib.h>
-#include <luajit-2.1/lua.h>
+#include <lauxlib.h>
+#include <lua.h>
 #include <stdbool.h>
 #include <wayland-util.h>
 

@@ -19,8 +19,8 @@
 #include "util/prelude.h"
 #include "wrap.h"
 #include <fcntl.h>
-#include <luajit-2.1/lauxlib.h>
-#include <luajit-2.1/lua.h>
+#include <lauxlib.h>
+#include <lua.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>

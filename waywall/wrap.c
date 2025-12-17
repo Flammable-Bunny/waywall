@@ -546,6 +546,9 @@ wrap_create(struct server *server, struct inotify *inotify, struct ww_timer *tim
         ww_log(LOG_ERROR, "failed to initialize OpenGL");
         goto fail_gl;
     }
+    // Respect config: disable tearing -> use vsync (swap interval 1)
+    server_gl_set_tearing(wrap->gl, cfg->experimental.tearing);
+    server_gl_set_force_cpu_copy(wrap->gl, wrap->gl->force_cpu_copy);
 
     wrap->scene = scene_create(cfg, wrap->gl, server->ui);
     if (!wrap->scene) {

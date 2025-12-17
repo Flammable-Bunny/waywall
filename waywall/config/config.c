@@ -8,10 +8,10 @@
 #include "util/log.h"
 #include "util/prelude.h"
 #include <linux/input-event-codes.h>
-#include <luajit-2.1/lauxlib.h>
-#include <luajit-2.1/lua.h>
-#include <luajit-2.1/luajit.h>
-#include <luajit-2.1/lualib.h>
+#include <lauxlib.h>
+#include <lua.h>
+#include <luajit.h>
+#include <lualib.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>

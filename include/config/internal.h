@@ -2,7 +2,7 @@
 #define WAYWALL_CONFIG_INTERNAL_H
 
 #include "config/config.h"
-#include <luajit-2.1/lua.h>
+#include <lua.h>
 #include <stdint.h>
 
 int config_api_init(struct config_vm *vm);

@@ -7,6 +7,7 @@
 #include "server/ui.h"
 #include "server/wl_compositor.h"
 #include "server/wp_linux_dmabuf.h"
+#include "server/wp_linux_drm_syncobj.h"
 #include "util/alloc.h"
 #include "util/log.h"
 #include "util/prelude.h"
@@ -23,6 +24,9 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <linux/dma-buf.h>
+#include <xf86drm.h>
+#include <libdrm/drm.h>
+
 #include <wayland-client-core.h>
 #include <wayland-egl.h>
 
@@ -129,6 +133,9 @@ struct gl_buffer {
     GLenum gl_format;          // GL format for texture upload
     GLenum gl_type;            // GL type for texture upload
     int dmabuf_fd;             // dmabuf fd for sync operations
+    int release_fd;            // dup'd release timeline fd (if provided)
+    uint32_t release_point_hi;
+    uint32_t release_point_lo;
 };
 
 // clang-format off
@@ -202,6 +209,126 @@ static bool gl_checkerr(const char *msg);
 
 static void gl_buffer_destroy(struct gl_buffer *gl_buffer);
 static struct gl_buffer *gl_buffer_import(struct server_gl *gl, struct server_buffer *buffer);
+static void gl_buffer_signal_release(struct server_gl *gl, struct gl_buffer *gl_buffer);
+
+static uint64_t
+syncobj_point_value(uint32_t hi, uint32_t lo) {
+    return ((uint64_t)hi << 32) | lo;
+}
+
+// Wait for the acquire timeline point to signal before sampling the dmabuf.
+static void
+wait_for_acquire_fence(struct server_gl *gl, struct server_surface *surface) {
+    if (!surface || !surface->syncobj) {
+        return;
+    }
+    struct server_drm_syncobj_surface *syncobj = surface->syncobj;
+    if (syncobj->acquire.fd == -1) {
+        return;
+    }
+    if (gl->drm_fd < 0) {
+        static bool warned_no_fd = false;
+        if (!warned_no_fd) {
+            ww_log(LOG_WARN, "acquire fence provided but no DRM fd available for waits");
+            warned_no_fd = true;
+        }
+        return;
+    }
+
+    static bool warned_import = false;
+    static bool warned_wait = false;
+    uint32_t handle = 0;
+    if (drmSyncobjFDToHandle(gl->drm_fd, syncobj->acquire.fd, &handle) != 0) {
+        if (!warned_import) {
+            ww_log_errno(LOG_WARN, "failed to import acquire syncobj fd");
+            warned_import = true;
+        }
+        return;
+    }
+
+    uint64_t point = syncobj_point_value(syncobj->acquire.point_hi, syncobj->acquire.point_lo);
+    // 5s is deliberately high to avoid tearing; failures will still log.
+    uint32_t wait_flags = DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT;
+    int ret = drmSyncobjTimelineWait(gl->drm_fd, &handle, &point, 1, 5 * 1000000000ULL,
+                                     wait_flags, NULL);
+    if (ret != 0 && !warned_wait) {
+        ww_log_errno(LOG_WARN, "acquire fence wait failed");
+        warned_wait = true;
+    }
+
+    drmSyncobjDestroy(gl->drm_fd, handle);
+}
+
+static void
+gl_buffer_store_release(struct gl_buffer *gl_buffer, struct server_drm_syncobj_surface *syncobj) {
+    if (gl_buffer->release_fd != -1) {
+        close(gl_buffer->release_fd);
+        gl_buffer->release_fd = -1;
+    }
+
+    if (!syncobj || syncobj->release.fd == -1) {
+        gl_buffer->release_point_hi = 0;
+        gl_buffer->release_point_lo = 0;
+        return;
+    }
+
+    gl_buffer->release_fd = dup(syncobj->release.fd);
+    if (gl_buffer->release_fd == -1) {
+        ww_log_errno(LOG_WARN, "failed to dup release syncobj fd");
+        gl_buffer->release_point_hi = 0;
+        gl_buffer->release_point_lo = 0;
+        return;
+    }
+
+    gl_buffer->release_point_hi = syncobj->release.point_hi;
+    gl_buffer->release_point_lo = syncobj->release.point_lo;
+}
+
+// Signal the stored release point once we're done sampling the buffer.
+static void
+gl_buffer_signal_release(struct server_gl *gl, struct gl_buffer *gl_buffer) {
+    if (!gl_buffer || gl_buffer->release_fd == -1) {
+        return;
+    }
+
+    static bool warned_no_fd = false;
+    static bool warned_import = false;
+    static bool warned_signal = false;
+
+    if (gl->drm_fd < 0) {
+        if (!warned_no_fd) {
+            ww_log(LOG_WARN, "release fence provided but no DRM fd available to signal");
+            warned_no_fd = true;
+        }
+        close(gl_buffer->release_fd);
+        gl_buffer->release_fd = -1;
+        return;
+    }
+
+    uint32_t handle = 0;
+    uint64_t point = syncobj_point_value(gl_buffer->release_point_hi, gl_buffer->release_point_lo);
+
+    if (drmSyncobjFDToHandle(gl->drm_fd, gl_buffer->release_fd, &handle) != 0) {
+        if (!warned_import) {
+            ww_log_errno(LOG_WARN, "failed to import release syncobj fd");
+            warned_import = true;
+        }
+        close(gl_buffer->release_fd);
+        gl_buffer->release_fd = -1;
+        return;
+    }
+
+    if (drmSyncobjTimelineSignal(gl->drm_fd, &handle, &point, 1) != 0) {
+        if (!warned_signal) {
+            ww_log_errno(LOG_WARN, "failed to signal release syncobj point");
+            warned_signal = true;
+        }
+    }
+
+    drmSyncobjDestroy(gl->drm_fd, handle);
+    close(gl_buffer->release_fd);
+    gl_buffer->release_fd = -1;
+}
 
 // Sync dmabuf for CPU read - ensures GPU writes are visible
 static void
@@ -253,23 +380,31 @@ gl_buffer_update_cpu(struct gl_buffer *gl_buffer) {
 static void
 on_surface_commit(struct wl_listener *listener, void *data) {
     struct server_gl *gl = wl_container_of(listener, gl, on_surface_commit);
+    struct gl_buffer *previous = gl->capture.current;
 
     wl_signal_emit_mutable(&gl->events.frame, NULL);
 
     struct server_buffer *buffer = server_surface_next_buffer(gl->capture.surface);
     if (!buffer) {
+        gl_buffer_signal_release(gl, previous);
         gl->capture.current = NULL;
         return;
     }
+
+    wait_for_acquire_fence(gl, gl->capture.surface);
 
     // Check if the committed wl_buffer has already been imported.
     struct gl_buffer *gl_buffer;
     wl_list_for_each (gl_buffer, &gl->capture.buffers, link) {
         if (gl_buffer->parent == buffer) {
+            gl_buffer_store_release(gl_buffer, gl->capture.surface->syncobj);
             // For CPU-copied buffers, we need to re-upload the texture data
             // because the dmabuf contents change each frame
             gl_buffer_update_cpu(gl_buffer);
             gl->capture.current = gl_buffer;
+            if (previous && previous != gl_buffer) {
+                gl_buffer_signal_release(gl, previous);
+            }
             return;
         }
     }
@@ -281,6 +416,8 @@ on_surface_commit(struct wl_listener *listener, void *data) {
         return;
     }
 
+    gl_buffer_store_release(gl_buffer, gl->capture.surface->syncobj);
+
     // If there are too many cached buffers, remove the oldest one.
     if (wl_list_length(&gl->capture.buffers) > MAX_CACHED_DMABUF) {
         struct gl_buffer *buffer;
@@ -291,6 +428,9 @@ on_surface_commit(struct wl_listener *listener, void *data) {
     }
 
     gl->capture.current = gl_buffer;
+    if (previous && previous != gl_buffer) {
+        gl_buffer_signal_release(gl, previous);
+    }
 }
 
 static void
@@ -408,6 +548,8 @@ gl_checkerr(const char *msg) {
 
 static void
 gl_buffer_destroy(struct gl_buffer *gl_buffer) {
+    gl_buffer_signal_release(gl_buffer->gl, gl_buffer);
+
     server_buffer_unref(gl_buffer->parent);
 
     eglMakeCurrent(gl_buffer->gl->egl.display, EGL_NO_SURFACE, EGL_NO_SURFACE,
@@ -523,6 +665,7 @@ gl_buffer_import_cpu(struct server_gl *gl, struct server_buffer *buffer) {
     gl_buffer->gl_type = gl_type;
     gl_buffer->image = EGL_NO_IMAGE_KHR;
     gl_buffer->dmabuf_fd = data->planes[0].fd;
+    gl_buffer->release_fd = -1;
 
     // Create OpenGL texture and upload pixel data
     glGenTextures(1, &gl_buffer->texture);
@@ -566,11 +709,17 @@ gl_buffer_import(struct server_gl *gl, struct server_buffer *buffer) {
         return NULL;
     }
 
+    // Optional override: force CPU copy path to avoid GPU implicit sync issues.
+    if (gl->force_cpu_copy) {
+        return gl_buffer_import_cpu(gl, buffer);
+    }
+
     struct gl_buffer *gl_buffer = zalloc(1, sizeof(*gl_buffer));
     gl_buffer->gl = gl;
     gl_buffer->cpu_copied = false;
 
     gl_buffer->parent = server_buffer_ref(buffer);
+    gl_buffer->release_fd = -1;
 
     // Attempt to create an EGLImageKHR for the given DMABUF.
     struct server_dmabuf_data *data = buffer->data;
@@ -786,6 +935,8 @@ server_gl_create(struct server *server) {
     struct server_gl *gl = zalloc(1, sizeof(*gl));
 
     gl->server = server;
+    gl->tearing = true; // default to previous behavior (tearing allowed)
+    gl->force_cpu_copy = getenv("WAYWALL_ZINK_FORCE_CPU_COPY") != NULL;
     
     ww_log(LOG_INFO, "=== WAYWALL GPU-ONLY BUILD (v2) - CPU FALLBACK DISABLED ===");
 
@@ -892,6 +1043,7 @@ server_gl_create(struct server *server) {
     gl->surface.subsurface = wl_subcompositor_get_subsurface(
         server->backend->subcompositor, gl->surface.remote, server->ui->tree.surface);
     check_alloc(gl->surface.subsurface);
+    // Default to tearing; caller can switch to sync via server_gl_set_tearing().
     wl_subsurface_set_desync(gl->surface.subsurface);
 
     // Use arbitrary sizes here since the main UI window has not yet been sized.
@@ -1065,8 +1217,26 @@ server_gl_set_capture(struct server_gl *gl, struct server_surface *surface) {
 
 void
 server_gl_swap_buffers(struct server_gl *gl) {
-    eglSwapInterval(gl->egl.display, 0);
+    eglSwapInterval(gl->egl.display, gl->tearing ? 0 : 1);
     eglSwapBuffers(gl->egl.display, gl->surface.egl);
+}
+
+void
+server_gl_set_tearing(struct server_gl *gl, bool tearing) {
+    gl->tearing = tearing;
+
+    if (gl->surface.subsurface) {
+        if (gl->tearing) {
+            wl_subsurface_set_desync(gl->surface.subsurface);
+        } else {
+            wl_subsurface_set_sync(gl->surface.subsurface);
+        }
+    }
+}
+
+void
+server_gl_set_force_cpu_copy(struct server_gl *gl, bool force_cpu_copy) {
+    gl->force_cpu_copy = force_cpu_copy;
 }
 
 void

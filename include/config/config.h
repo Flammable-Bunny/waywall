@@ -1,7 +1,7 @@
 #ifndef WAYWALL_CONFIG_CONFIG_H
 #define WAYWALL_CONFIG_CONFIG_H
 
-#include <luajit-2.1/lua.h>
+#include <lua.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>

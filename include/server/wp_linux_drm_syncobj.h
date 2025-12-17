@@ -26,6 +26,7 @@ struct server_drm_syncobj_surface {
 
     struct server_drm_syncobj_point {
         int32_t fd;
+        int32_t timeline_fd;
         uint32_t point_hi, point_lo;
     } acquire, release;
 };

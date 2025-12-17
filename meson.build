@@ -47,6 +47,7 @@ spng = dependency('spng')
 avif = dependency('libavif')
 wayland_egl = dependency('wayland-egl')
 gbm = dependency('gbm')
+libdrm = dependency('libdrm')
 
 xcb = dependency('xcb')
 xcb_composite = dependency('xcb-composite')
@@ -72,6 +73,7 @@ waywall_deps = [
   avif,
   wayland_egl,
   gbm,
+  libdrm,
 
   xcb,
   xcb_composite,

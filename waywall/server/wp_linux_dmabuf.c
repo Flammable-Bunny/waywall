@@ -169,46 +169,46 @@ on_linux_dmabuf_feedback_format_table(void *data, struct zwp_linux_dmabuf_feedba
                                       int32_t fd, uint32_t size) {
     struct server_linux_dmabuf_feedback *feedback = data;
 
-    // Close AMD's format table - we'll send our own with LINEAR formats only
-    close(fd);
+    if (feedback->parent->allow_modifiers) {
+        // Pass through the compositor's format table unchanged (modifiers allowed)
+        ww_log(LOG_INFO, "dmabuf feedback: passing through format table (modifiers allowed)");
+        zwp_linux_dmabuf_feedback_v1_send_format_table(feedback->resource, fd, size);
+        close(fd);
+    } else {
+        // Override with LINEAR-only formats for safer cross-GPU import
+        close(fd);
 
-    // Create our own format table with LINEAR formats for cross-GPU compatibility
-    // These formats work across Intel, AMD, and NVIDIA with LINEAR modifier
-    struct format_table_entry entries[] = {
-        { DRM_FORMAT_XRGB8888, 0, DRM_FORMAT_MOD_LINEAR },
-        { DRM_FORMAT_ARGB8888, 0, DRM_FORMAT_MOD_LINEAR },
-        { DRM_FORMAT_XBGR8888, 0, DRM_FORMAT_MOD_LINEAR },
-        { DRM_FORMAT_ABGR8888, 0, DRM_FORMAT_MOD_LINEAR },
-    };
+        struct format_table_entry entries[] = {
+            { DRM_FORMAT_XRGB8888, 0, DRM_FORMAT_MOD_LINEAR },
+            { DRM_FORMAT_ARGB8888, 0, DRM_FORMAT_MOD_LINEAR },
+            { DRM_FORMAT_XBGR8888, 0, DRM_FORMAT_MOD_LINEAR },
+            { DRM_FORMAT_ABGR8888, 0, DRM_FORMAT_MOD_LINEAR },
+        };
+        size_t table_size = sizeof(entries);
 
-    size_t table_size = sizeof(entries);
+        int new_fd = ww_memfd_create("dmabuf-format-table", MFD_CLOEXEC);
+        if (new_fd < 0) {
+            ww_log(LOG_ERROR, "failed to create memfd for LINEAR format table");
+            return;
+        }
+        if (ftruncate(new_fd, table_size) < 0) {
+            ww_log(LOG_ERROR, "failed to truncate LINEAR format table fd");
+            close(new_fd);
+            return;
+        }
+        void *map = mmap(NULL, table_size, PROT_READ | PROT_WRITE, MAP_SHARED, new_fd, 0);
+        if (map == MAP_FAILED) {
+            ww_log(LOG_ERROR, "failed to mmap LINEAR format table");
+            close(new_fd);
+            return;
+        }
+        memcpy(map, entries, table_size);
+        munmap(map, table_size);
 
-    // Create a memfd for our format table
-    int new_fd = ww_memfd_create("dmabuf-format-table", MFD_CLOEXEC);
-    if (new_fd < 0) {
-        ww_log(LOG_ERROR, "failed to create memfd for LINEAR format table");
-        return;
-    }
-
-    if (ftruncate(new_fd, table_size) < 0) {
-        ww_log(LOG_ERROR, "failed to truncate LINEAR format table fd");
+        ww_log(LOG_INFO, "dmabuf feedback: overriding format table with LINEAR-only formats");
+        zwp_linux_dmabuf_feedback_v1_send_format_table(feedback->resource, new_fd, table_size);
         close(new_fd);
-        return;
     }
-
-    void *map = mmap(NULL, table_size, PROT_READ | PROT_WRITE, MAP_SHARED, new_fd, 0);
-    if (map == MAP_FAILED) {
-        ww_log(LOG_ERROR, "failed to mmap LINEAR format table");
-        close(new_fd);
-        return;
-    }
-
-    memcpy(map, entries, table_size);
-    munmap(map, table_size);
-
-    ww_log(LOG_INFO, "sending LINEAR-only format table for cross-GPU compatibility");
-    zwp_linux_dmabuf_feedback_v1_send_format_table(feedback->resource, new_fd, table_size);
-    close(new_fd);
 }
 
 static void
@@ -242,21 +242,21 @@ on_linux_dmabuf_feedback_tranche_formats(void *data, struct zwp_linux_dmabuf_fee
                                          struct wl_array *indices) {
     struct server_linux_dmabuf_feedback *feedback = data;
 
-    // Always override to use indices 0-3 (our 4 LINEAR formats).
-    // Waywall's GL pipeline can only handle LINEAR modifiers, regardless of compositor mode.
-    struct wl_array override_indices;
-    wl_array_init(&override_indices);
-
-    // Add indices 0, 1, 2, 3 for our 4 LINEAR format entries
-    for (uint16_t i = 0; i < 4; i++) {
-        uint16_t *idx = wl_array_add(&override_indices, sizeof(uint16_t));
-        *idx = i;
+    if (feedback->parent->allow_modifiers) {
+        // Pass through tranche formats unchanged so clients can use modifiers
+        ww_log(LOG_INFO, "dmabuf feedback: passing through tranche_formats (modifiers allowed)");
+        zwp_linux_dmabuf_feedback_v1_send_tranche_formats(feedback->resource, indices);
+    } else {
+        struct wl_array override_indices;
+        wl_array_init(&override_indices);
+        for (uint16_t i = 0; i < 4; i++) {
+            uint16_t *idx = wl_array_add(&override_indices, sizeof(uint16_t));
+            *idx = i;
+        }
+        ww_log(LOG_INFO, "dmabuf feedback: overriding tranche_formats with LINEAR-only indices");
+        zwp_linux_dmabuf_feedback_v1_send_tranche_formats(feedback->resource, &override_indices);
+        wl_array_release(&override_indices);
     }
-
-    ww_log(LOG_INFO, "dmabuf feedback: overriding tranche_formats with LINEAR-only indices (0-3)");
-
-    zwp_linux_dmabuf_feedback_v1_send_tranche_formats(feedback->resource, &override_indices);
-    wl_array_release(&override_indices);
 }
 
 static void
@@ -655,6 +655,7 @@ struct server_linux_dmabuf *
 server_linux_dmabuf_create(struct server *server) {
     struct server_linux_dmabuf *linux_dmabuf = zalloc(1, sizeof(*linux_dmabuf));
     linux_dmabuf->server = server;
+    linux_dmabuf->allow_modifiers = getenv("WAYWALL_DMABUF_FORCE_LINEAR") == NULL;
 
     linux_dmabuf->global = wl_global_create(server->display, &zwp_linux_dmabuf_v1_interface,
                                             SRV_LINUX_DMABUF_VERSION, linux_dmabuf, on_global_bind);
